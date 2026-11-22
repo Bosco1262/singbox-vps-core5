@@ -39,9 +39,12 @@
 ### 1. Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/Bosco1262/singbox-vps-core5.git /usr/local/src/singbox-vps-core5
+# Clone the repository as root
+sudo git clone https://github.com/Bosco1262/singbox-vps-core5.git /usr/local/src/singbox-vps-core5
 cd /usr/local/src/singbox-vps-core5
+
+# Grant execute permissions after cloning
+sudo chmod +x install.sh sbox5
 
 # Run installer (Interactive mode)
 sudo ./install.sh

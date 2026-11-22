@@ -39,9 +39,12 @@
 ### 1. 安装
 
 ```bash
-# 克隆仓库
-git clone https://github.com/Bosco1262/singbox-vps-core5.git /usr/local/src/singbox-vps-core5
+# 使用 sudo 克隆仓库
+sudo git clone https://github.com/Bosco1262/singbox-vps-core5.git /usr/local/src/singbox-vps-core5
 cd /usr/local/src/singbox-vps-core5
+
+# 拉取后赋予执行权限
+sudo chmod +x install.sh sbox5
 
 # 运行安装程序（交互式引导）
 sudo ./install.sh
