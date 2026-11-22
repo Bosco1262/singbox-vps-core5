@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Bosco1262
+# SPDX-License-Identifier: GPL-3.0-or-later
+set -Eeuo pipefail
+umask 077
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if ! command -v python3 >/dev/null 2>&1; then
+  language="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
+  previous=""
+  for argument in "$@"; do
+    case "$previous" in
+      -l|--lang|--language) language="$argument" ;;
+    esac
+    case "$argument" in
+      -l=*|--lang=*|--language=*) language="${argument#*=}" ;;
+    esac
+    previous="$argument"
+  done
+  case "$language" in
+    zh*|ZH*|Zh*|zH*) message='错误：需要 Python 3.10 或更高版本。请先从系统官方仓库安装 python3。' ;;
+    *) message='Error: Python 3.10 or later is required. Install python3 from the official system repository first.' ;;
+  esac
+  printf '%s\n' "$message" >&2
+  exit 1
+fi
+exec python3 -I "$ROOT/src/main.py" --project-root "$ROOT" "$@"

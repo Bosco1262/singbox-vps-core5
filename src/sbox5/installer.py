@@ -1,0 +1,433 @@
+# Copyright (C) 2026 Bosco1262
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import os
+from pathlib import Path
+import shutil
+import subprocess
+from typing import Any
+
+from . import __version__
+from .certificates import certificate_metadata, create_self_signed, install_acme_certificate, issue_acme
+from .config import CERTIFICATE_PATH, KEY_PATH, build_server_config, check_server_config, config_bytes, generate_reality_keypair
+from .ddns import CloudflareDDNS
+from .download import install_locked_binary
+from .errors import ConfigError, ConflictError
+from .export import export_nodes
+from .firewall import apply_firewall, needs_firewall_service
+from .i18n import get_language, tr
+from .models import Secrets, Settings
+from .services import (
+    acme_timer,
+    acme_unit,
+    argo_unit,
+    copy_application,
+    ddns_timer,
+    ddns_unit,
+    enable_start,
+    ensure_system_user,
+    firewall_unit,
+    identity,
+    reload_systemd,
+    require_active,
+    singbox_unit,
+)
+from .snapshot import SNAPSHOT_ROOT, Snapshot, prune_snapshots
+from .system import architecture, check_ports, configure_bbr, ensure_packages, preflight
+from .util import atomic_json, atomic_text, atomic_write, load_json, run
+
+CONFIG_DIR = Path("/etc/sbox5")
+SETTINGS_PATH = CONFIG_DIR / "settings.json"
+SECRETS_PATH = CONFIG_DIR / "secrets/protocols.json"
+SERVER_CONFIG_PATH = CONFIG_DIR / "config.json"
+ARGO_TOKEN_PATH = CONFIG_DIR / "secrets/argo.token"
+DDNS_TOKEN_PATH = CONFIG_DIR / "secrets/cloudflare.token"
+STATE_DIR = Path("/var/lib/sbox5")
+STATE_PATH = STATE_DIR / "state.json"
+FIREWALL_STATE_PATH = STATE_DIR / "firewall.json"
+CERTIFICATE_STATE_PATH = STATE_DIR / "certificate.json"
+DDNS_STATE_PATH = STATE_DIR / "ddns/last.json"
+EXPORT_DIR = STATE_DIR / "exports"
+SYSCTL_PATH = Path("/etc/sysctl.d/99-sbox5.conf")
+BINARY_DIR = Path("/usr/local/libexec/sbox5/bin")
+SINGBOX_BINARY = BINARY_DIR / "sing-box"
+CLOUDFLARED_BINARY = BINARY_DIR / "cloudflared"
+UNIT_DIR = Path("/etc/systemd/system")
+UNITS = (
+    "sbox5.service", "sbox5-argo.service", "sbox5-ddns.service", "sbox5-ddns.timer",
+    "sbox5-firewall.service", "sbox5-acme.service", "sbox5-acme.timer",
+)
+
+
+def load_settings() -> Settings:
+    return Settings.from_dict(load_json(SETTINGS_PATH))
+
+
+def load_secrets() -> Secrets:
+    return Secrets.from_dict(load_json(SECRETS_PATH))
+
+
+def _excluded(path: Path) -> bool:
+    return (
+        "__pycache__" in path.parts or path.suffix == ".pyc"
+        or SNAPSHOT_ROOT == path or SNAPSHOT_ROOT in path.parents
+        or Path("/var/lib/sbox5/staging") == path or Path("/var/lib/sbox5/staging") in path.parents
+        or Path("/etc/sbox5/acme") == path or Path("/etc/sbox5/acme") in path.parents
+        or Path("/var/lib/sbox5/acme") == path or Path("/var/lib/sbox5/acme") in path.parents
+    )
+
+
+def managed_files() -> list[Path]:
+    files = {
+        SETTINGS_PATH, SECRETS_PATH, SERVER_CONFIG_PATH, ARGO_TOKEN_PATH, DDNS_TOKEN_PATH,
+        CERTIFICATE_PATH, KEY_PATH, STATE_PATH, FIREWALL_STATE_PATH, CERTIFICATE_STATE_PATH,
+        DDNS_STATE_PATH, SYSCTL_PATH, Path("/usr/local/bin/sbox5"), SINGBOX_BINARY, CLOUDFLARED_BINARY,
+        *(UNIT_DIR / name for name in UNITS),
+    }
+    for root in (CONFIG_DIR, Path("/usr/local/libexec/sbox5"), STATE_DIR):
+        if root.exists():
+            for path in root.rglob("*"):
+                if path.is_file() and not _excluded(path):
+                    files.add(path)
+    return sorted(files)
+
+
+def _managed_directories() -> list[Path]:
+    return [
+        CONFIG_DIR, CONFIG_DIR / "secrets", CONFIG_DIR / "tls", CONFIG_DIR / "acme/config",
+        STATE_DIR, SNAPSHOT_ROOT, STATE_DIR / "ddns", STATE_DIR / "exports", STATE_DIR / "acme/work",
+        Path("/var/lib/sbox5-runtime"), Path("/var/log/sbox5-acme"),
+        Path("/usr/local/libexec/sbox5"), Path("/usr/local/libexec/sbox5/app"), BINARY_DIR,
+    ]
+
+
+class InstallTransaction:
+    def __init__(
+        self,
+        project_root: Path,
+        settings: Settings,
+        secrets: Secrets,
+        *,
+        upgrade: bool,
+        ddns_token: str = "",
+        argo_token: str = "",
+    ) -> None:
+        self.project_root = project_root.resolve()
+        self.settings = settings
+        self.secrets = secrets
+        self.upgrade = upgrade
+        self.ddns_token = ddns_token
+        self.argo_token = argo_token
+        self.snapshot: Snapshot | None = None
+        self.previous_state: dict[str, Any] = {}
+        self.previous_settings: Settings | None = None
+        self.components: dict[str, Any] = {}
+        self.sysctls: list[dict[str, str]] = []
+        self.users: list[str] = ["sbox5"]
+        self.committed = False
+
+    def _record(self, path: Path) -> None:
+        assert self.snapshot is not None
+        target = str(path.absolute())
+        if not any(entry["path"] == target for entry in self.snapshot.manifest["files"]):
+            self.snapshot.track_new(path)
+        self.snapshot.record_after(path)
+
+    def _write(self, path: Path, data: bytes, mode: int = 0o600, uid: int | None = None, gid: int | None = None) -> None:
+        atomic_write(path, data, mode, uid, gid)
+        self._record(path)
+
+    def _json(self, path: Path, value: Any, mode: int = 0o600, uid: int | None = None, gid: int | None = None) -> None:
+        atomic_json(path, value, mode, uid, gid)
+        self._record(path)
+
+    def _remove(self, path: Path) -> None:
+        if path.is_symlink():
+            raise ConflictError(tr(f"Refusing to delete a symbolic link: {path}", f"拒绝删除符号链接：{path}"))
+        if path.exists():
+            if not path.is_file():
+                raise ConflictError(tr(f"Refusing to delete a non-regular file: {path}", f"拒绝删除非普通文件：{path}"))
+            path.unlink()
+            self._record(path)
+
+    def _mkdir(self, path: Path, mode: int, uid: int | None = None, gid: int | None = None) -> None:
+        path.mkdir(parents=True, exist_ok=True, mode=mode)
+        if path.is_symlink():
+            raise ConflictError(tr(f"A project directory must not be a symbolic link: {path}", f"项目目录不能是符号链接：{path}"))
+        os.chmod(path, mode)
+        if uid is not None and gid is not None:
+            os.chown(path, uid, gid)
+
+    def _stop_existing_services(self) -> None:
+        for name in UNITS:
+            if (UNIT_DIR / name).exists():
+                run(["systemctl", "stop", name], check=False)
+
+    def _create_users(self) -> None:
+        assert self.snapshot is not None
+        requested = ["sbox5"]
+        if self.settings.ddns.enabled:
+            requested.append("sbox5-ddns")
+        if self.settings.argo.enabled:
+            requested.append("sbox5-argo")
+        if self.upgrade:
+            requested = sorted(set(requested + self.previous_state.get("users", [])))
+        for name in requested:
+            created = ensure_system_user(name, allow_existing=self.upgrade)
+            if created:
+                self.snapshot.manifest["users_created"].append(name)
+        self.users = requested
+
+    def _write_tokens(self) -> None:
+        if self.settings.ddns.enabled:
+            if not self.ddns_token and DDNS_TOKEN_PATH.is_file() and not DDNS_TOKEN_PATH.is_symlink():
+                self.ddns_token = DDNS_TOKEN_PATH.read_text(encoding="utf-8").strip()
+            if not self.ddns_token:
+                raise ConfigError(tr("Enabling DDNS requires a Cloudflare Token", "启用 DDNS 需要 Cloudflare Token"))
+            uid, gid = identity("sbox5-ddns")
+            self._write(DDNS_TOKEN_PATH, (self.ddns_token + "\n").encode(), 0o600, uid, gid)
+        else:
+            self._remove(DDNS_TOKEN_PATH)
+        if self.settings.argo.enabled:
+            if not self.argo_token and ARGO_TOKEN_PATH.is_file() and not ARGO_TOKEN_PATH.is_symlink():
+                self.argo_token = ARGO_TOKEN_PATH.read_text(encoding="utf-8").strip()
+            if not self.argo_token:
+                raise ConfigError(tr("Enabling Argo requires a Tunnel Token", "启用 Argo 需要 Tunnel Token"))
+            uid, gid = identity("sbox5-argo")
+            self._write(ARGO_TOKEN_PATH, (self.argo_token + "\n").encode(), 0o600, uid, gid)
+        else:
+            self._remove(ARGO_TOKEN_PATH)
+
+    def _write_settings(self) -> None:
+        gid = identity("sbox5-ddns")[1] if self.settings.ddns.enabled else 0
+        self._json(SETTINGS_PATH, self.settings.as_dict(), 0o640 if self.settings.ddns.enabled else 0o600, 0, gid)
+        self._json(SECRETS_PATH, self.secrets.as_dict(), 0o600)
+
+    def _configure_sysctl(self) -> None:
+        assert self.snapshot is not None
+        previous_records = self.previous_state.get("sysctls", [])
+        previous_bbr = bool(self.previous_settings and self.previous_settings.bbr)
+        if self.settings.bbr:
+            if previous_bbr and previous_records:
+                self.snapshot.manifest["sysctls"] = previous_records
+            else:
+                self.snapshot.manifest["sysctls"] = [
+                    {"key": key, "before": run(["sysctl", "-n", key], check=False).stdout.strip(), "after": value}
+                    for key, value in (("net.core.default_qdisc", "fq"), ("net.ipv4.tcp_congestion_control", "bbr"))
+                ]
+            records = configure_bbr(SYSCTL_PATH)
+            self._record(SYSCTL_PATH)
+            self.snapshot.manifest["sysctls"] = previous_records if previous_bbr and previous_records else records
+            self.sysctls = self.snapshot.manifest["sysctls"]
+        else:
+            if previous_bbr:
+                self.snapshot.manifest["sysctls"] = [
+                    {"key": record["key"], "before": record["before"], "after": record.get("after", "")}
+                    for record in previous_records
+                ]
+                for record in previous_records:
+                    run(["sysctl", "-w", f"{record['key']}={record['before']}"])
+            self._remove(SYSCTL_PATH)
+            self.sysctls = []
+
+    def _install_units(self) -> None:
+        desired: dict[str, str] = {"sbox5.service": singbox_unit(self.settings)}
+        if self.settings.argo.enabled:
+            desired["sbox5-argo.service"] = argo_unit()
+        if self.settings.ddns.enabled:
+            desired["sbox5-ddns.service"] = ddns_unit()
+            desired["sbox5-ddns.timer"] = ddns_timer(self.settings.ddns.interval_seconds)
+        if needs_firewall_service(self.settings):
+            desired["sbox5-firewall.service"] = firewall_unit()
+        if self.settings.certificate_mode == "acme":
+            desired["sbox5-acme.service"] = acme_unit()
+            desired["sbox5-acme.timer"] = acme_timer()
+        for name in UNITS:
+            path = UNIT_DIR / name
+            if name in desired:
+                atomic_text(path, desired[name], 0o644)
+                self._record(path)
+            else:
+                run(["systemctl", "disable", name], check=False)
+                self._remove(path)
+        reload_systemd()
+
+    def _rollback(self) -> None:
+        if not self.snapshot:
+            return
+        shutil.rmtree(STATE_DIR / "staging", ignore_errors=True)
+        self.snapshot.seal()
+        command = ["python3", "-I", str(self.snapshot.path / "restore.py"), "--snapshot", str(self.snapshot.path), "--automatic", "--lang", get_language()]
+        result = subprocess.run(command, text=True, capture_output=True, shell=False, check=False)
+        if result.returncode != 0:
+            raise ConflictError(tr(
+                f"Installation failed and automatic rollback did not complete. The snapshot is kept at {self.snapshot.path}.\n"
+                f"After checking, run: python3 {self.snapshot.path / 'restore.py'}\n{result.stderr.strip()}",
+                f"安装失败且自动回滚未完成。快照保留在 {self.snapshot.path}。\n"
+                f"请检查后运行：python3 {self.snapshot.path / 'restore.py'}\n{result.stderr.strip()}",
+            ))
+
+    def run(self) -> dict[str, Any]:
+        preflight()
+        fresh_markers = (
+            CONFIG_DIR, Path("/usr/local/libexec/sbox5"), STATE_DIR,
+            Path("/usr/local/bin/sbox5"), SYSCTL_PATH, *(UNIT_DIR / name for name in UNITS),
+        )
+        if self.upgrade:
+            if not SETTINGS_PATH.is_file() or not SECRETS_PATH.is_file() or not STATE_PATH.is_file():
+                raise ConfigError(tr("A complete existing sbox5 installation was not found; cannot upgrade", "找不到完整的现有 sbox5 安装，不能升级"))
+            self.previous_state = load_json(STATE_PATH)
+            self.previous_settings = load_settings()
+            self.sysctls = self.previous_state.get("sysctls", [])
+        elif any(path.exists() for path in fresh_markers):
+            raise ConflictError(tr("Existing sbox5 paths were detected; to avoid taking over unknown files, use upgrade or inspect them manually first", "检测到已存在的 sbox5 路径；为避免接管未知文件，请使用 upgrade 或先人工检查"))
+        self.snapshot = Snapshot.create(
+            SNAPSHOT_ROOT, self.project_root, managed_files(), _managed_directories(), UNITS,
+        )
+        try:
+            if self.settings.ddns.enabled:
+                self.snapshot.manifest["external_resources"].append({"type": "cloudflare-dns", "name": self.settings.ddns.record})
+            if self.settings.argo.enabled:
+                self.snapshot.manifest["external_resources"].append({"type": "cloudflare-argo", "name": self.settings.argo.hostname})
+            if self.settings.certificate_mode == "acme":
+                self.snapshot.manifest["external_resources"].append({"type": "acme-local-state", "name": tr("/etc/sbox5/acme (preserved on rollback)", "/etc/sbox5/acme（回滚保留）")})
+            self._stop_existing_services()
+            check_ports(self.settings)
+            self.snapshot.manifest["packages"] = ensure_packages(self.settings)
+            self._create_users()
+            self._mkdir(CONFIG_DIR, 0o711)
+            self._mkdir(CONFIG_DIR / "secrets", 0o711)
+            singbox_uid, singbox_gid = identity("sbox5")
+            self._mkdir(CONFIG_DIR / "tls", 0o750, singbox_uid, singbox_gid)
+            self._mkdir(STATE_DIR, 0o711)
+            self._mkdir(SNAPSHOT_ROOT, 0o700)
+            self._mkdir(EXPORT_DIR, 0o700)
+            self._mkdir(Path("/var/lib/sbox5-runtime"), 0o700, singbox_uid, singbox_gid)
+            if self.settings.ddns.enabled:
+                ddns_uid, ddns_gid = identity("sbox5-ddns")
+                self._mkdir(STATE_DIR / "ddns", 0o700, ddns_uid, ddns_gid)
+            self._mkdir(BINARY_DIR, 0o755)
+            self._write_tokens()
+            self._write_settings()
+            self.components["sing-box"] = install_locked_binary(
+                "sing-box", architecture(), self.project_root, SINGBOX_BINARY, STATE_DIR / "staging",
+            )
+            self._record(SINGBOX_BINARY)
+            run([str(SINGBOX_BINARY), "version"], timeout=30)
+            if not self.secrets.reality_private_key or not self.secrets.reality_public_key:
+                generate_reality_keypair(SINGBOX_BINARY, self.secrets)
+                self._write_settings()
+            if self.settings.argo.enabled:
+                self.components["cloudflared"] = install_locked_binary(
+                    "cloudflared", architecture(), self.project_root, CLOUDFLARED_BINARY, STATE_DIR / "staging",
+                )
+                self._record(CLOUDFLARED_BINARY)
+                run([str(CLOUDFLARED_BINARY), "--version"], timeout=30)
+            else:
+                self._remove(CLOUDFLARED_BINARY)
+            if (STATE_DIR / "staging").exists():
+                shutil.rmtree(STATE_DIR / "staging")
+            for path in copy_application(self.project_root):
+                self._record(path)
+            self.snapshot.record_nft_owned("before")
+            firewall_result = apply_firewall(
+                self.settings,
+                FIREWALL_STATE_PATH,
+                lambda resource, action: self.snapshot.manifest["firewall"]["owned"].append({**resource, "action": action}),
+            )
+            self._record(FIREWALL_STATE_PATH)
+            self.snapshot.record_nft_owned("after")
+            if self.settings.ddns.enabled:
+                result = CloudflareDDNS(self.settings.ddns, self.ddns_token).sync(DDNS_STATE_PATH)
+                ddns_uid, ddns_gid = identity("sbox5-ddns")
+                os.chown(DDNS_STATE_PATH, ddns_uid, ddns_gid)
+                self._record(DDNS_STATE_PATH)
+                self.snapshot.manifest["operations"].append({"type": "ddns.initial", "changes": result["changes"]})
+            if self.settings.certificate_mode == "self-signed":
+                preserve = (
+                    self.upgrade and CERTIFICATE_PATH.is_file() and KEY_PATH.is_file()
+                    and self.previous_settings and self.previous_settings.tls_server_name == self.settings.tls_server_name
+                )
+                metadata = certificate_metadata(CERTIFICATE_PATH) if preserve else create_self_signed(
+                    self.settings, CERTIFICATE_PATH, KEY_PATH, singbox_uid, singbox_gid,
+                )
+                if not preserve:
+                    self._record(CERTIFICATE_PATH)
+                    self._record(KEY_PATH)
+            else:
+                self._mkdir(CONFIG_DIR / "acme/config", 0o700)
+                self._mkdir(STATE_DIR / "acme/work", 0o700)
+                self._mkdir(Path("/var/log/sbox5-acme"), 0o700)
+                source = CONFIG_DIR / "acme/config/live" / self.settings.domain / "fullchain.pem"
+                if not source.is_file():
+                    issue_acme(self.settings.domain, self.settings.acme_email)
+                metadata = install_acme_certificate(self.settings.domain, CERTIFICATE_PATH, KEY_PATH, singbox_uid, singbox_gid)
+                self._record(CERTIFICATE_PATH)
+                self._record(KEY_PATH)
+            self._json(CERTIFICATE_STATE_PATH, metadata, 0o600)
+            self._write(SERVER_CONFIG_PATH, config_bytes(build_server_config(self.settings, self.secrets)), 0o640, singbox_uid, singbox_gid)
+            check_server_config(SINGBOX_BINARY, SERVER_CONFIG_PATH)
+            exported = export_nodes(self.settings, self.secrets, CERTIFICATE_PATH, metadata, EXPORT_DIR)
+            for path in EXPORT_DIR.iterdir():
+                if path.is_file():
+                    self._record(path)
+            check_server_config(SINGBOX_BINARY, EXPORT_DIR / "sing-box-client.json")
+            self._configure_sysctl()
+            self._install_units()
+            if (UNIT_DIR / "sbox5-firewall.service").exists():
+                enable_start("sbox5-firewall.service")
+                require_active("sbox5-firewall.service")
+            enable_start("sbox5.service")
+            require_active("sbox5.service")
+            if self.settings.argo.enabled:
+                enable_start("sbox5-argo.service")
+                require_active("sbox5-argo.service")
+            if self.settings.ddns.enabled:
+                run(["systemctl", "start", "sbox5-ddns.service"], timeout=180)
+                self._record(DDNS_STATE_PATH)
+                enable_start("sbox5-ddns.timer")
+                require_active("sbox5-ddns.timer")
+            if self.settings.certificate_mode == "acme":
+                enable_start("sbox5-acme.timer")
+                require_active("sbox5-acme.timer")
+            self.snapshot.record_nft_owned("after")
+            for entry in self.snapshot.manifest["files"]:
+                path = Path(entry["path"])
+                if path.exists() or entry.get("after") is not None:
+                    self._record(path)
+            state = {
+                "schema_version": 1,
+                "project_version": __version__,
+                "installed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "components": self.components,
+                "users": self.users,
+                "sysctls": self.sysctls,
+                "managed_files": [entry["path"] for entry in self.snapshot.manifest["files"] if Path(entry["path"]).exists()],
+                "snapshot_id": self.snapshot.manifest["snapshot_id"],
+                "firewall": firewall_result,
+            }
+            self._json(STATE_PATH, state, 0o600)
+            self._record(STATE_PATH)
+            self.snapshot.commit()
+            self.committed = True
+            try:
+                prune_snapshots(SNAPSHOT_ROOT, keep=3)
+            except OSError as exc:
+                print(tr(f"Warning: failed to clean up old snapshots: {exc}", f"警告：旧快照清理失败：{exc}"))
+            return {
+                "snapshot": str(self.snapshot.path),
+                "exports": str(EXPORT_DIR),
+                "files": exported["files"],
+                "warnings": exported["warnings"] + firewall_result["warnings"],
+            }
+        except Exception as exc:
+            if self.committed:
+                raise
+            try:
+                self._rollback()
+            except Exception as rollback_error:
+                raise ConflictError(f"{exc}\n{rollback_error}") from exc
+            raise ConflictError(tr(f"Installation failed and was rolled back automatically. The snapshot is kept at {self.snapshot.path}. Reason: {exc}", f"安装失败，已自动回滚。快照保留在 {self.snapshot.path}。原因：{exc}")) from exc
