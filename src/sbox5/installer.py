@@ -128,6 +128,25 @@ def _excluded(path: Path) -> bool:
     )
 
 
+def _fresh_install_conflicts() -> list[Path]:
+    markers = [
+        CONFIG_DIR, Path("/usr/local/libexec/sbox5"),
+        Path("/usr/local/bin/sbox5"), SYSCTL_PATH,
+        *(UNIT_DIR / name for name in UNITS), *(service_path(name) for name in UNITS),
+    ]
+    conflicts = [path for path in markers if path.exists() or path.is_symlink()]
+    if STATE_DIR.is_symlink() or (STATE_DIR.exists() and not STATE_DIR.is_dir()):
+        conflicts.append(STATE_DIR)
+    elif STATE_DIR.is_dir():
+        snapshot_root = STATE_DIR / "snapshots"
+        for entry in STATE_DIR.iterdir():
+            if entry.name != "snapshots":
+                conflicts.append(entry)
+        if snapshot_root.exists() and not snapshot_root.is_dir():
+            conflicts.append(snapshot_root)
+    return sorted(set(conflicts), key=str)
+
+
 def managed_files(settings: Settings | None = None) -> list[Path]:
     files = {
         SETTINGS_PATH, SECRETS_PATH, SERVER_CONFIG_PATH, ARGO_TOKEN_PATH, DDNS_TOKEN_PATH,
@@ -470,19 +489,20 @@ class InstallTransaction:
         preflight()
         warnings: list[str] = []
         argo_state: dict[str, Any] = {}
-        fresh_markers = (
-            CONFIG_DIR, Path("/usr/local/libexec/sbox5"), STATE_DIR,
-            Path("/usr/local/bin/sbox5"), SYSCTL_PATH,
-            *(UNIT_DIR / name for name in UNITS), *(service_path(name) for name in UNITS),
-        )
         if self.upgrade or self.reconfigure:
             if not SETTINGS_PATH.is_file() or not SECRETS_PATH.is_file() or not STATE_PATH.is_file():
                 raise ConfigError(tr("A complete existing sbox5 installation was not found; cannot reconfigure", "找不到完整的现有 sbox5 安装，不能重新配置"))
             self.previous_state = load_json(STATE_PATH)
             self.previous_settings = load_settings()
             self.sysctls = self.previous_state.get("sysctls", [])
-        elif any(path.exists() for path in fresh_markers):
-            raise ConflictError(tr("Existing sbox5 paths were detected; to avoid taking over unknown files, use upgrade or inspect them manually first", "检测到已存在的 sbox5 路径；为避免接管未知文件，请使用 upgrade 或先人工检查"))
+        else:
+            conflicts = _fresh_install_conflicts()
+            if conflicts:
+                paths = "\n".join(f" - {path}" for path in conflicts)
+                raise ConflictError(tr(
+                    f"Existing sbox5 paths were detected:\n{paths}\nTo avoid taking over unknown files, inspect them first. If they are only rollback snapshots, move them aside and retry.",
+                    f"检测到已存在的 sbox5 路径：\n{paths}\n为避免接管未知文件，请先人工检查。如果它们只是回滚快照，请先移走后再试。",
+                ))
         self.snapshot = Snapshot.create(
             SNAPSHOT_ROOT, self.project_root, managed_files(self.settings), _managed_directories(self.settings), UNITS,
             feature=self.feature,

@@ -5,7 +5,7 @@
 [![License: GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://www.python.org/)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Debian%2012%2B%20%7C%20Ubuntu%2022.04%2B%20%7C%20Alpine%203.20%2B%20%7C%20RHEL%209%2B-orange.svg)]()
-[![Tests: 89 Passed](https://img.shields.io/badge/Tests-89%20Passed-brightgreen.svg)]()
+[![Tests: 90 Passed](https://img.shields.io/badge/Tests-90%20Passed-brightgreen.svg)]()
 
 **singbox-vps-core5** (`sbox5`) is a production-hardened, auditable, and rollback-ready proxy suite for Linux VPS. It enables seamless coexistence of five modern protocols (**VLESS-Reality**, **VMess-WS**, **Hysteria2**, **TUIC v5**, and **AnyTLS**) under strict security isolation, non-root systemd sandboxing, and immutable supply-chain locking.
 

@@ -7,6 +7,7 @@ import importlib.util
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -18,6 +19,7 @@ from sbox5.cli import build_parser
 from sbox5.errors import ConfigError, ConflictError
 from sbox5.export import build_share_links
 from sbox5.firewall import apply_firewall
+from sbox5.installer import _fresh_install_conflicts
 from sbox5.models import Ports, Secrets, Settings
 from sbox5.services import (
     openrc_argo,
@@ -170,6 +172,23 @@ class FirewalldTests(unittest.TestCase):
         with mock.patch("sbox5.firewall._firewalld_active", return_value=True):
             with self.assertRaises(ConflictError):
                 apply_firewall(configured)
+
+
+class FreshInstallTests(unittest.TestCase):
+    def test_rollback_snapshots_do_not_block_fresh_install(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            state = root / "var/lib/sbox5"
+            (state / "snapshots").mkdir(parents=True)
+            with mock.patch("sbox5.installer.STATE_DIR", state), \
+                 mock.patch("sbox5.installer.CONFIG_DIR", root / "etc/sbox5"), \
+                 mock.patch("sbox5.installer.SYSCTL_PATH", root / "etc/sysctl.d/99-sbox5.conf"), \
+                 mock.patch("sbox5.installer.UNIT_DIR", root / "etc/systemd/system"), \
+                 mock.patch("sbox5.installer.service_path", side_effect=lambda name: root / "units" / name):
+                self.assertEqual(_fresh_install_conflicts(), [])
+                (state / "state.json").write_text("{}", encoding="utf-8")
+                conflicts = _fresh_install_conflicts()
+                self.assertIn(state / "state.json", conflicts)
 
 
 class RestoreAllowlistTests(unittest.TestCase):
