@@ -125,7 +125,7 @@ def build_server_config(settings: Settings, secrets: Secrets) -> dict[str, Any]:
             "tag": "vmess-ws",
             "listen": "::",
             "listen_port": settings.ports.vmess,
-            "users": [{"name": "vmess", "uuid": secrets.vmess_uuid, "alter_id": 0}],
+            "users": [{"name": "vmess", "uuid": secrets.vmess_uuid, "alterId": 0}],
             "transport": {"type": "ws", "path": secrets.vmess_path, "max_early_data": 0},
         }
         profile_id = settings.protocols["vmess"].tls_profile
@@ -138,7 +138,7 @@ def build_server_config(settings: Settings, secrets: Secrets) -> dict[str, Any]:
                 "tag": "vmess-argo-origin",
                 "listen": "127.0.0.1",
                 "listen_port": settings.argo.local_port,
-                "users": [{"name": "vmess-argo", "uuid": secrets.vmess_uuid, "alter_id": 0}],
+                "users": [{"name": "vmess-argo", "uuid": secrets.vmess_uuid, "alterId": 0}],
                 "transport": {"type": "ws", "path": secrets.vmess_path, "max_early_data": 0},
             })
     if settings.protocols["hysteria2"].enabled:

@@ -91,7 +91,7 @@ class ConfigTests(unittest.TestCase):
         inbounds = {item["type"]: item for item in document["inbounds"]}
         self.assertNotIn("transport", inbounds["vless"])
         self.assertNotIn("certificate_path", inbounds["vless"]["tls"])
-        self.assertEqual(inbounds["vmess"]["users"][0]["alter_id"], 0)
+        self.assertEqual(inbounds["vmess"]["users"][0]["alterId"], 0)
         self.assertEqual(inbounds["hysteria2"]["obfs"]["password"], secret.hysteria2_obfs_password)
         self.assertNotEqual(inbounds["hysteria2"]["users"][0]["password"], secret.hysteria2_obfs_password)
         self.assertNotIn("version", inbounds["tuic"])
