@@ -5,7 +5,7 @@
 [![License: GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://www.python.org/)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Debian%2012%2B%20%7C%20Ubuntu%2022.04%2B%20%7C%20Alpine%203.20%2B%20%7C%20RHEL%209%2B-orange.svg)]()
-[![Tests: 88 Passed](https://img.shields.io/badge/Tests-88%20Passed-brightgreen.svg)]()
+[![Tests: 89 Passed](https://img.shields.io/badge/Tests-89%20Passed-brightgreen.svg)]()
 
 **singbox-vps-core5** (`sbox5`) 是一个面向 Linux VPS 的生产加固、可审计且支持故障回滚的多协议代理套件。在严苛的安全隔离、非 root systemd 沙盒与不可变供应链锁的保护下，实现五大现代协议（**VLESS-Reality**、**VMess-WS**、**Hysteria2**、**TUIC v5** 与 **AnyTLS**）的原生平滑共存。
 
@@ -39,7 +39,7 @@
 
 - **操作系统**：Debian 12+ / Ubuntu 22.04+ / Alpine 3.20+ / RHEL 9+、Rocky 9+ 或 AlmaLinux 9+（64-bit x86_64 / arm64）
 - **Init 系统**：Debian/Ubuntu/RHEL 使用 systemd；Alpine 使用 OpenRC
-- **虚拟化架构**：KVM / 物理机（需独立内核模块支持）
+- **虚拟化架构**：KVM、Google Compute Engine、AWS、Azure/Hyper-V、VMware、Xen 或具有独立内核的物理机；预检会拒绝 Docker、LXC、WSL 等容器/共享内核环境。
 - **运行环境**：Python 3.10+（标准库）
 - **防火墙**：UFW、nftables 或 iptables。RHEL 上 firewalld 运行时 sbox5 不会修改 firewalld：请先用 `firewall-cmd` 开放端口，再使用 `--no-firewall` 安装，或明确停用 firewalld。
 

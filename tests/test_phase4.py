@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from sbox5 import network
 from sbox5.cli import build_parser
-from sbox5.errors import ConflictError
+from sbox5.errors import ConfigError, ConflictError
 from sbox5.export import build_share_links
 from sbox5.firewall import apply_firewall
 from sbox5.models import Ports, Secrets, Settings
@@ -28,7 +28,7 @@ from sbox5.services import (
     openrc_subscription,
 )
 from sbox5.snapshot import _service_state
-from sbox5.system import _family, _version_numbers
+from sbox5.system import _check_virtualization, _family, _version_numbers
 
 
 def settings(**changes) -> Settings:
@@ -144,6 +144,16 @@ class PlatformTests(unittest.TestCase):
     def test_versions(self):
         self.assertEqual(_version_numbers("3.20.3"), (3, 20, 3))
         self.assertEqual(_version_numbers("22.04"), (22, 4))
+
+    def test_virtualization_allows_google_and_rejects_containers(self):
+        google = subprocess.CompletedProcess([], 0, "google\n", "")
+        with mock.patch("sbox5.system.available", return_value=True), \
+             mock.patch("sbox5.system.run", side_effect=[google, google]):
+            _check_virtualization()
+        with mock.patch("sbox5.system.available", return_value=True), \
+             mock.patch("sbox5.system.run", return_value=subprocess.CompletedProcess([], 0, "docker\n", "")):
+            with self.assertRaises(ConfigError):
+                _check_virtualization()
 
     def test_cli_phase4_commands_parse(self):
         parser = build_parser()

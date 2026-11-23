@@ -62,6 +62,36 @@ def package_manager() -> str:
     raise ConfigError(tr("No supported official package manager was found", "找不到受支持的官方包管理器"))
 
 
+CONTAINER_VIRT = frozenset({
+    "docker", "podman", "lxc", "lxc-libvirt", "systemd-nspawn", "openvz", "rkt", "pouch", "proot", "wsl",
+})
+VM_VIRT = frozenset({
+    "kvm", "qemu", "amazon", "google", "microsoft", "oracle", "vmware", "xen", "bochs", "parallels", "bhyve",
+    "uml", "virtualbox",
+})
+
+
+def _check_virtualization() -> None:
+    if not available("systemd-detect-virt"):
+        return
+    result = run(["systemd-detect-virt"], check=False)
+    virtualization = result.stdout.strip().lower()
+    if virtualization in ("", "none"):
+        return
+    if virtualization in CONTAINER_VIRT:
+        raise ConfigError(tr(
+            f"Only VMs or VPS instances with an independent kernel are supported; the current environment is a container: {virtualization}",
+            f"仅支持具有独立内核的虚拟机或 VPS；当前为容器环境：{virtualization}",
+        ))
+    vm_result = run(["systemd-detect-virt", "--vm"], check=False)
+    if vm_result.returncode == 0 or virtualization in VM_VIRT:
+        return
+    raise ConfigError(tr(
+        f"Only VMs or VPS instances with an independent kernel are supported; current environment: {virtualization}",
+        f"仅支持具有独立内核的虚拟机或 VPS；当前环境：{virtualization}",
+    ))
+
+
 def preflight() -> None:
     require_linux_root()
     if sys.version_info < (3, 10):
@@ -92,11 +122,7 @@ def preflight() -> None:
             raise ConfigError(tr("Alpine must boot with OpenRC; containers without an init system are not supported", "Alpine 必须使用 OpenRC 启动；不支持无 init 的容器"))
     elif backend != "systemd" or Path("/proc/1/comm").read_text(encoding="utf-8").strip() != "systemd":
         raise ConfigError(tr("PID 1 must be systemd on Debian/Ubuntu/RHEL", "Debian/Ubuntu/RHEL 的 PID 1 必须是 systemd"))
-    if available("systemd-detect-virt"):
-        result = run(["systemd-detect-virt"], check=False)
-        virtualization = result.stdout.strip()
-        if virtualization not in ("", "none", "kvm"):
-            raise ConfigError(tr(f"Only KVM or VPS environments with an independent kernel are supported; the current one is {virtualization}", f"仅支持 KVM 或独立内核 VPS，当前环境为 {virtualization}"))
+    _check_virtualization()
     wanted_manager = {"debian": "apt", "alpine": "apk", "rhel": "dnf"}[family]
     if package_manager() != wanted_manager:
         raise ConfigError(tr("The distribution's official package manager was not found", "找不到该发行版的官方包管理器"))
