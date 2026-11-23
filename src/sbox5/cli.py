@@ -42,6 +42,7 @@ from .kernel import status as core_status
 from .kernel import switch as core_switch
 from .models import (
     ArgoSettings,
+    CdnProfile,
     CertificateProfile,
     DDNSSettings,
     DomainRoute,
@@ -55,8 +56,19 @@ from .models import (
     Socks5Settings,
     WarpCredential,
 )
-from .services import require_active
+from .services import identity, require_active
 from .snapshot import SNAPSHOT_ROOT
+from .subscription import (
+    BUNDLE_DIR as SUBSCRIPTION_BUNDLE_DIR,
+    CONFIG_PATH as SUBSCRIPTION_CONFIG_PATH,
+    TOKEN_PATH as SUBSCRIPTION_TOKEN_PATH,
+    base_url as subscription_base_url,
+    copy_bundle as subscription_copy_bundle,
+    generate_token as subscription_generate_token,
+    read_token as subscription_read_token,
+    serve as subscription_serve,
+    status as subscription_status,
+)
 from .system import read_token_file, validate_token_text
 from .util import available, load_json, require_linux_root, run, split_host_port
 from .warp import import_warp_credential, register_warp
@@ -332,8 +344,10 @@ def _status() -> int:
         "warp": settings.warp.as_dict(),
         "warp_credential": secrets.warp.public_state(),
         "routing": settings.routing.as_dict(),
+        "cdn": settings.cdn.as_dict(),
+        "subscription": settings.subscription.as_dict(),
     }, ensure_ascii=False, indent=2, sort_keys=True))
-    for name in ("sbox5.service", "sbox5-argo.service", "sbox5-ddns.timer", "sbox5-firewall.service"):
+    for name in ("sbox5.service", "sbox5-argo.service", "sbox5-ddns.timer", "sbox5-subscription.service", "sbox5-firewall.service"):
         if (Path("/etc/systemd/system") / name).exists():
             result = run(["systemctl", "is-active", name], check=False)
             print(f"{name}: {result.stdout.strip() or result.returncode}")
@@ -384,6 +398,13 @@ def _export() -> int:
         certificates=certificates, argo_host=_current_argo_host(settings),
     )
     check_server_config(SINGBOX_BINARY, EXPORT_DIR / "sing-box-client.json")
+    check_server_config(SINGBOX_BINARY, EXPORT_DIR / "sfa.json")
+    if settings.subscription.enabled:
+        try:
+            sub_uid, sub_gid = identity("sbox5-sub")
+            subscription_copy_bundle(EXPORT_DIR, SUBSCRIPTION_BUNDLE_DIR, sub_uid, sub_gid)
+        except KeyError:
+            print(tr("Warning: subscription service user is missing; the bundle was not refreshed.", "警告：订阅服务用户缺失，订阅包未刷新。"), file=sys.stderr)
     print(tr("Exported to ", "已导出到 ") + str(EXPORT_DIR))
     for warning in result["warnings"]:
         print(tr("Warning: ", "警告：") + warning)
@@ -394,6 +415,7 @@ def _check() -> int:
     require_linux_root()
     check_server_config(SINGBOX_BINARY, Path("/etc/sbox5/config.json"))
     check_server_config(SINGBOX_BINARY, EXPORT_DIR / "sing-box-client.json")
+    check_server_config(SINGBOX_BINARY, EXPORT_DIR / "sfa.json")
     print(tr(
         "Server and sing-box client configurations both passed sing-box check.",
         "服务端与 sing-box 客户端配置均通过 sing-box check。",
@@ -431,6 +453,7 @@ def _apply_reconfigure(
     import_files: dict[str, tuple[Path, Path]] | None = None,
     rule_set_files: dict[str, Path] | None = None,
     argo_token: str = "",
+    subscription_token: str = "",
 ) -> int:
     settings.validate()
     secrets.validate()
@@ -438,6 +461,7 @@ def _apply_reconfigure(
     result = reconfigure(
         args.project_root, settings, secrets, feature,
         import_files=import_files, rule_set_files=rule_set_files, argo_token=argo_token,
+        subscription_token=subscription_token,
     )
     print(tr("Configuration transaction committed.", "配置事务已提交。"))
     print(tr("Snapshot: ", "快照：") + result["snapshot"])
@@ -538,6 +562,11 @@ def _argo(args: argparse.Namespace) -> int:
         print(json.dumps(state, ensure_ascii=False, sort_keys=True))
         if not url:
             print(tr("Warning: the quick tunnel URL is not available yet.", "警告：临时隧道 URL 尚未出现。"), file=sys.stderr)
+        elif settings.subscription.enabled:
+            print(tr(
+                "Run 'sbox5 export' to refresh the subscription bundle with the new Argo URL.",
+                "请运行 sbox5 export，以将新的 Argo URL 刷新到订阅包。",
+            ), file=sys.stderr)
         return 0
     raise ConfigError(tr("Unknown Argo command", "未知 Argo 命令"))
 
@@ -817,6 +846,90 @@ def _core(args: argparse.Namespace) -> int:
     raise ConfigError(tr("Unknown core command", "未知内核命令"))
 
 
+def _cdn(args: argparse.Namespace) -> int:
+    require_linux_root()
+    settings, secrets = load_settings(), load_secrets()
+    if args.cdn_command == "list":
+        data = settings.cdn.as_dict()
+        print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) if args.json else json.dumps(data, ensure_ascii=False, sort_keys=True))
+        return 0
+    profile = settings.cdn.vmess if args.target == "vmess" else settings.cdn.argo
+    if args.cdn_command == "set":
+        profile.enabled = True
+        profile.address = args.address
+        profile.port = args.port
+        profile.host = args.host or ""
+        profile.sni = args.sni or ""
+        return _apply_reconfigure(args, settings, secrets, "cdn")
+    if args.cdn_command == "clear":
+        if args.target == "vmess":
+            settings.cdn.vmess = CdnProfile()
+        else:
+            settings.cdn.argo = CdnProfile()
+        return _apply_reconfigure(args, settings, secrets, "cdn")
+    raise ConfigError(tr("Unknown CDN command", "未知 CDN 命令"))
+
+
+def _subscription(args: argparse.Namespace) -> int:
+    if args.subscription_command == "serve":
+        return subscription_serve()
+    require_linux_root()
+    settings, secrets = load_settings(), load_secrets()
+    if args.subscription_command == "status":
+        unit = Path("/etc/systemd/system/sbox5-subscription.service")
+        active = run(["systemctl", "is-active", "sbox5-subscription.service"], check=False).stdout.strip() if unit.exists() else "not-installed"
+        data = {
+            "settings": settings.subscription.as_dict(),
+            "config": subscription_status(SUBSCRIPTION_CONFIG_PATH),
+            "service": active,
+        }
+        print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) if args.json else json.dumps(data, ensure_ascii=False, sort_keys=True))
+        return 0
+    if args.subscription_command == "url":
+        token = subscription_read_token(SUBSCRIPTION_TOKEN_PATH)
+        if not token:
+            raise ConfigError(tr("The subscription token is missing", "订阅 Token 缺失"))
+        url = subscription_base_url(settings, token) + "base64"
+        print(url)
+        if settings.subscription.bind == "127.0.0.1" and not settings.subscription.tls_profile:
+            print(tr(
+                "The service is bound to localhost. Publish it through a TLS reverse proxy before sharing the URL.",
+                "服务绑定在 localhost。共享 URL 前请通过 TLS 反向代理发布。",
+            ), file=sys.stderr)
+        return 0
+    if args.subscription_command == "set":
+        settings.subscription.enabled = True
+        if args.bind:
+            settings.subscription.bind = args.bind
+        if args.port is not None:
+            settings.subscription.port = args.port
+        if args.tls_profile is not None:
+            settings.subscription.tls_profile = "" if args.tls_profile.lower() in ("none", "off", "disabled") else args.tls_profile
+        return _apply_reconfigure(args, settings, secrets, "subscription")
+    if args.subscription_command == "enable":
+        settings.subscription.enabled = True
+        return _apply_reconfigure(args, settings, secrets, "subscription")
+    if args.subscription_command == "disable":
+        settings.subscription.enabled = False
+        return _apply_reconfigure(args, settings, secrets, "subscription")
+    if args.subscription_command in ("start", "stop"):
+        unit = Path("/etc/systemd/system/sbox5-subscription.service")
+        if not unit.exists():
+            raise ConfigError(tr("The subscription service is not installed", "订阅服务未安装"))
+        run(["systemctl", args.subscription_command, "sbox5-subscription.service"], timeout=90)
+        if args.subscription_command == "start":
+            require_active("sbox5-subscription.service")
+        return 0
+    if args.subscription_command == "rotate":
+        if not settings.subscription.enabled:
+            raise ConfigError(tr("The subscription service is disabled", "订阅服务未启用"))
+        token = subscription_generate_token()
+        _apply_reconfigure(args, settings, secrets, "subscription", subscription_token=token)
+        print(tr("New subscription URL: ", "新的订阅 URL：") + subscription_base_url(settings, token) + "base64")
+        return 0
+    raise ConfigError(tr("Unknown subscription command", "未知订阅命令"))
+
+
 def _snapshots() -> int:
     require_linux_root()
     if not SNAPSHOT_ROOT.exists():
@@ -1024,6 +1137,39 @@ def build_parser() -> argparse.ArgumentParser:
     core_switch.add_argument("--yes", action="store_true")
     core_rollback = core_commands.add_parser("rollback", parents=[language], help=tr("Roll back to the previous core version", "回滚到上一版内核"))
     core_rollback.add_argument("--yes", action="store_true")
+    cdn = commands.add_parser("cdn", parents=[language], help=tr("Manage VMess/Argo CDN preference", "管理 VMess/Argo CDN 优选"))
+    cdn_commands = cdn.add_subparsers(dest="cdn_command", required=True)
+    cdn_list = cdn_commands.add_parser("list", parents=[language], help=tr("Show CDN settings", "显示 CDN 设置"))
+    cdn_list.add_argument("--json", action="store_true")
+    cdn_set = cdn_commands.add_parser("set", parents=[language], help=tr("Set a CDN preferred address", "设置 CDN 优选地址"))
+    cdn_set.add_argument("--target", choices=("vmess", "argo"), required=True)
+    cdn_set.add_argument("--address", required=True)
+    cdn_set.add_argument("--port", type=int, default=443)
+    cdn_set.add_argument("--host")
+    cdn_set.add_argument("--sni")
+    cdn_set.add_argument("--yes", action="store_true")
+    cdn_clear = cdn_commands.add_parser("clear", parents=[language], help=tr("Clear CDN settings for a target", "清除目标的 CDN 设置"))
+    cdn_clear.add_argument("--target", choices=("vmess", "argo"), required=True)
+    cdn_clear.add_argument("--yes", action="store_true")
+    subscription = commands.add_parser("subscription", parents=[language], help=tr("Manage the local subscription service", "管理本地订阅服务"))
+    subscription_commands = subscription.add_subparsers(dest="subscription_command", required=True)
+    subscription_status = subscription_commands.add_parser("status", parents=[language], help=tr("Show subscription service status", "显示订阅服务状态"))
+    subscription_status.add_argument("--json", action="store_true")
+    subscription_commands.add_parser("url", parents=[language], help=tr("Print the tokenized subscription URL", "输出带 Token 的订阅 URL"))
+    subscription_set = subscription_commands.add_parser("set", parents=[language], help=tr("Configure and enable the subscription service", "配置并启用订阅服务"))
+    subscription_set.add_argument("--bind", choices=("127.0.0.1", "0.0.0.0"))
+    subscription_set.add_argument("--port", type=int)
+    subscription_set.add_argument("--tls-profile", help=tr("Self-signed/imported profile ID, or 'none'", "自签/导入证书配置 ID，或 none"))
+    subscription_set.add_argument("--yes", action="store_true")
+    subscription_enable = subscription_commands.add_parser("enable", parents=[language], help=tr("Enable the subscription service", "启用订阅服务"))
+    subscription_enable.add_argument("--yes", action="store_true")
+    subscription_disable = subscription_commands.add_parser("disable", parents=[language], help=tr("Disable and remove the subscription service", "禁用并移除订阅服务"))
+    subscription_disable.add_argument("--yes", action="store_true")
+    subscription_commands.add_parser("start", parents=[language], help=tr("Start the subscription service", "启动订阅服务"))
+    subscription_commands.add_parser("stop", parents=[language], help=tr("Stop the subscription service", "停止订阅服务"))
+    subscription_rotate = subscription_commands.add_parser("rotate", parents=[language], help=tr("Rotate the subscription path token", "轮换订阅路径 Token"))
+    subscription_rotate.add_argument("--yes", action="store_true")
+    commands.add_parser("subscription-serve", parents=[language], help=argparse.SUPPRESS).add_argument("--non-interactive", action="store_true")
     commands.add_parser("ddns-update", parents=[language], help=argparse.SUPPRESS).add_argument("--non-interactive", action="store_true")
     commands.add_parser("firewall-apply", parents=[language], help=argparse.SUPPRESS).add_argument("--non-interactive", action="store_true")
     commands.add_parser("snapshots", parents=[language], help=tr("List transaction snapshots", "列出事务快照"))
@@ -1033,7 +1179,7 @@ def build_parser() -> argparse.ArgumentParser:
     uninstall = commands.add_parser("uninstall", parents=[language], help=tr("Remove project files and rules, keeping snapshots and packages", "移除项目文件和规则，保留快照与软件包"))
     uninstall.add_argument("--yes", action="store_true")
     uninstall.add_argument("--non-interactive", action="store_true")
-    hidden = {"ddns-update", "firewall-apply"}
+    hidden = {"ddns-update", "firewall-apply", "subscription-serve"}
     commands._choices_actions = [action for action in commands._choices_actions if action.dest not in hidden]
     return parser
 
@@ -1074,6 +1220,12 @@ def main(argv: list[str] | None = None) -> int:
             return _route(args)
         if args.command == "core":
             return _core(args)
+        if args.command == "cdn":
+            return _cdn(args)
+        if args.command == "subscription":
+            return _subscription(args)
+        if args.command == "subscription-serve":
+            return subscription_serve()
         if args.command == "ddns-update":
             return _ddns_update()
         if args.command == "firewall-apply":

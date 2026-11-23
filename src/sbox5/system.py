@@ -70,6 +70,8 @@ def check_ports(settings: Settings) -> None:
             occupied.append("acme-tls-alpn-01 443/tcp")
     if settings.argo.enabled and not port_is_free(settings.argo.local_port, "tcp"):
         occupied.append(f"argo-loopback {settings.argo.local_port}/tcp")
+    if settings.subscription.enabled and not port_is_free(settings.subscription.port, "tcp"):
+        occupied.append(f"subscription {settings.subscription.port}/tcp")
     if occupied:
         raise ConfigError(tr("The following ports are already in use: ", "以下端口已被占用：") + tr(", ", "、").join(occupied))
 

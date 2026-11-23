@@ -5,7 +5,7 @@
 [![License: GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://www.python.org/)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Debian%2012%2B%20%7C%20Ubuntu%2022.04%2B-orange.svg)]()
-[![Tests: 61 Passed](https://img.shields.io/badge/Tests-61%20Passed-brightgreen.svg)]()
+[![Tests: 73 Passed](https://img.shields.io/badge/Tests-73%20Passed-brightgreen.svg)]()
 
 **singbox-vps-core5** (`sbox5`) is a production-hardened, auditable, and rollback-ready proxy suite for Linux VPS. It enables seamless coexistence of five modern protocols (**VLESS-Reality**, **VMess-WS**, **Hysteria2**, **TUIC v5**, and **AnyTLS**) under strict security isolation, non-root systemd sandboxing, and immutable supply-chain locking.
 
@@ -15,7 +15,7 @@
 
 - **Coexisting 5 Modern Protocols**: VLESS-Reality, VMess-WebSocket (optional TLS), Hysteria2 (with Salamander obfs), TUIC v5 (BBR native), and AnyTLS running concurrently without conflicts. Each protocol can be enabled or disabled independently.
 - **Native ACME & Per-Protocol TLS**: sing-box native ACME certificate providers (HTTP-01, TLS-ALPN-01, DNS-01; IP certificates where the CA supports them) with per-protocol TLS profile binding. No certbot, no external renewal timer.
-- **Strict Non-Root Isolation**: Core proxy services run under dedicated non-login system accounts (`sbox5`, `sbox5-argo`, `sbox5-ddns`), eliminating privileged execution.
+- **Strict Non-Root Isolation**: Core proxy services run under dedicated non-login system accounts (`sbox5`, `sbox5-argo`, `sbox5-ddns`, `sbox5-sub`), eliminating privileged execution.
 - **Cryptographic Supply-Chain Locks**: Pinned upstream binaries via `locks/*.json` with strict SHA256 hashes and archive member security verification.
 - **Zero External Dependencies**: Pure Python 3.10+ standard library. Zero `pip` packages required.
 - **Fail-Safe Rollback & Snapshots**: Every install, upgrade, reconfigure, or uninstall creates an immutable snapshot with a self-contained offline `restore.py`.
@@ -25,6 +25,8 @@
 - **Hysteria2 / TUIC UDP Port Hopping**: Declarative UDP ranges are reconciled in dedicated firewall chains/table, with SNAT-style local redirects and precise rollback. TUIC has no standard port-range URI field, so the client must choose a concrete port.
 - **Argo Quick & Token Tunnels**: `cloudflared` quick tunnels and fixed token tunnels are managed as hardened non-root services. A dedicated loopback-only VMess ingress lets Argo coexist with public VMess TLS.
 - **Native WARP & Multi-Target Routing**: WARP credentials are registered through the Cloudflare client endpoint or imported manually (never shared keys). Domain suffixes and local `.srs` rule sets route to WARP, direct IPv4/IPv6, or an optional Socks5 outbound.
+- **CDN Preference & Full Client Export**: Optional VMess/Argo CDN preferred IP/domain with explicit Host/SNI; exports SFA, SFI, SFW, sing-box, Mihomo, share links, QR codes, and a Base64 subscription bundle.
+- **Local Subscription Service**: A dedicated non-root `sbox5-sub` service serves only a whitelisted bundle through a high-entropy path token. The server stores only the token hash; localhost + TLS reverse proxy is the default, with optional built-in TLS using a self-signed/imported profile.
 - **Locked Core Lifecycle**: Stable/channel/version switching only accepts immutable lock files, pre-checks the new binary with `sing-box check`, and rolls back automatically on failure.
 - **Zero-Trust TLS**: Self-signed mode automatically inlines certificates into sing-box client configs and binds full SHA256 DER fingerprints in Mihomo (Clash.Meta). No `insecure: true` anywhere.
 
@@ -82,6 +84,8 @@ sbox5 <subcommand>
   warp         Register, import, rotate, enable/disable, or clear WARP
   route        Manage domain routes, Socks5, and local .srs rule sets
   core         Show, list, switch, or roll back locked sing-box versions
+  cdn          Set or clear VMess/Argo CDN preferred address and Host/SNI
+  subscription Manage the local tokenized subscription service
   snapshots    List local transaction snapshots and states
   rollback     One-click system rollback using the snapshot's standalone restorer
   uninstall    Safe uninstall (creates snapshot, cleans rules and files, preserves packages)
@@ -131,7 +135,8 @@ After installation, complete client profiles are exported into a secure director
 /var/lib/sbox5/exports/
 ├── links.txt                # Universal share links (vless://, vmess://, hysteria2://, tuic://, anytls://)
 ├── subscription-base64.txt  # Base64 encoded subscription bundle
-├── sing-box-client.json     # Official sing-box client configuration
+├── sing-box-client.json     # Official sing-box mixed-inbound client configuration
+├── sfa.json / sfi.json / sfw.json  # Sing-box TUN profiles for Android/iOS/Windows
 ├── mihomo.yaml              # Mihomo (Clash.Meta) profile with bound certificate fingerprint
 ├── metadata.json            # Export metadata and TLS verification details
 ├── certificate*.pem         # Public self-signed/imported certificates for pinning
@@ -158,12 +163,13 @@ Host System (Debian 12 / Ubuntu 22.04)
  │    ├── settings.json             (0600 / 0640)
  │    ├── tls/ [cert.pem, key.pem]  (0750 dir, key: 0600, sbox5:sbox5)
  │    ├── tls/<profile>/            (additional certificate profiles)
- │    └── secrets/ [argo, ddns, protocols] (0711 dir, tokens: 0600)
+ │    └── secrets/ [argo, ddns, protocols, subscription] (0711 dir, tokens: 0600)
  ├── /var/lib/sbox5/
  │    ├── acme/<profile>/           (0700, native sing-box ACME state)
  │    ├── certificates.json         (per-profile certificate state)
  │    ├── argo/                     (state.json + quick tunnel log)
  │    ├── rulesets/                 (local .srs rule sets)
+ │    ├── subscription/             (0700, tokenized bundle + optional TLS)
  │    ├── core.json                 (current/previous core versions)
  │    ├── snapshots/                (0700, standalone snapshot storage)
  │    └── exports/                  (0700, client configuration profiles)
@@ -171,6 +177,7 @@ Host System (Debian 12 / Ubuntu 22.04)
       ├── sbox5.service             (User=sbox5, hardened systemd sandbox, native ACME)
       ├── sbox5-argo.service        (User=sbox5-argo, quick or token tunnel)
       ├── sbox5-ddns.timer          (User=sbox5-ddns, dual-source check)
+      ├── sbox5-subscription.service(User=sbox5-sub, tokenized local subscription)
       └── sbox5-firewall.service    (Minimal rule enforcement, no flush)
 ```
 
@@ -205,19 +212,46 @@ sudo sbox5 route list
 sudo sbox5 core list
 sudo sbox5 core switch --channel stable --yes
 sudo sbox5 core rollback --yes
+
+# CDN preference for VMess/Argo
+sudo sbox5 cdn set --target vmess --address 104.16.0.1 --host cdn.example.com --sni cdn.example.com --yes
+sudo sbox5 cdn set --target argo --address 104.16.0.1 --yes
+sudo sbox5 cdn list
+
+# Local subscription service (localhost + TLS reverse proxy recommended)
+sudo sbox5 subscription set --bind 127.0.0.1 --port 18090 --yes
+sudo sbox5 subscription url
+sudo sbox5 subscription rotate --yes
+
+# Optional built-in TLS using a self-signed/imported certificate profile
+sudo sbox5 subscription set --bind 0.0.0.0 --port 18090 --tls-profile default --yes
 ```
 
-WARP registration uses Cloudflare's client registration endpoint and is intentionally never replaced by hard-coded/shared private keys. If registration fails, the error is explicit; manual import remains available. WARP private keys stay in `secrets/protocols.json` (`0600`) and are injected into `config.json` (`0640 root:sbox5`) because sing-box needs them at runtime. Only locked sing-box versions are accepted; add a `locks/versions/<version>.json` file and set `channels.beta` in `locks/versions/index.json` before switching to a beta build.
+VMess CDN requires the origin VMess inbound to remain plaintext WebSocket; Argo CDN requires token mode because quick tunnel hostnames are ephemeral.
+
+The subscription service exposes only whitelisted bundle files:
+
+```text
+/sub/<token>/links       /sub/<token>/base64
+/sub/<token>/sing-box    /sub/<token>/sfa | sfi | sfw
+/sub/<token>/mihomo      /sub/<token>/clash
+/sub/<token>/metadata
+```
+
+Native ACME certificates cannot be read by the local subscription process; use a TLS reverse proxy for ACME, or a self-signed/imported certificate profile with built-in TLS. The raw token is stored only in `/etc/sbox5/secrets/subscription.token` (`0600`); the service config contains only its SHA256 hash.
+
+WARP registration uses Cloudflare's client registration endpoint and is never replaced by hard-coded/shared private keys. WARP private keys stay in `secrets/protocols.json` (`0600`) and are injected into `config.json` (`0640 root:sbox5`). Only locked sing-box versions are accepted; add a `locks/versions/<version>.json` file and set `channels.beta` in `locks/versions/index.json` before switching to a beta build.
 
 ---
 
-## Migration Notes (MVP → Phase 2)
+## Migration Notes (MVP → Phase 3)
 
 - `settings.json` / `state.json` are migrated from schema v1/v2 to v3 automatically. Original v1/v2 snapshots remain restorable by their own bundled `restore.py`.
 - Legacy certbot ACME profiles become native sing-box ACME profiles using HTTP-01 by default. The old certbot state under `/etc/sbox5/acme` is preserved but no longer used; the certificate is re-issued by sing-box on the next start.
 - Existing protocol ports and credentials are preserved. TUIC/Hysteria2 hopping ranges are reapplied through the firewall reconciliation path.
 - Existing Argo settings are migrated to token mode with the existing hostname. Argo now uses a loopback-only VMess ingress (`18081` by default), so VMess TLS and Argo can coexist; update the Cloudflare ingress to `http://127.0.0.1:18081`.
 - Phase 2 adds native WARP, optional Socks5, local `.srs` rule sets, and locked core switching. `warp-plus` / Psiphon remain intentionally excluded.
+- Phase 3 adds CDN preference, SFA/SFI/SFW exports, and a local subscription service only. GitLab/Telegram push are not included by design; use the tokenized subscription URL from your own HTTPS reverse proxy.
 
 ---
 

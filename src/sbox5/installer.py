@@ -20,6 +20,7 @@ from .config import (
     KEY_PATH,
     RULESET_DIR,
     build_server_config,
+    certificate_profile,
     check_server_config,
     config_bytes,
     generate_reality_keypair,
@@ -47,8 +48,18 @@ from .services import (
     reload_systemd,
     require_active,
     singbox_unit,
+    subscription_unit,
 )
 from .snapshot import SNAPSHOT_ROOT, Snapshot, prune_snapshots
+from .subscription import (
+    BUNDLE_DIR as SUBSCRIPTION_BUNDLE_DIR,
+    BUNDLE_FILES as SUBSCRIPTION_FILES,
+    CONFIG_PATH as SUBSCRIPTION_CONFIG_PATH,
+    TLS_DIR as SUBSCRIPTION_TLS_DIR,
+    TOKEN_PATH as SUBSCRIPTION_TOKEN_PATH,
+    generate_token,
+    token_hash,
+)
 from .system import architecture, check_ports, configure_bbr, ensure_packages, preflight
 from .util import atomic_json, atomic_text, atomic_write, load_json, run, sha256_file
 
@@ -78,6 +89,7 @@ UNIT_DIR = Path("/etc/systemd/system")
 UNITS = (
     "sbox5.service", "sbox5-argo.service", "sbox5-ddns.service", "sbox5-ddns.timer",
     "sbox5-firewall.service", "sbox5-acme.service", "sbox5-acme.timer",
+    "sbox5-subscription.service",
 )
 
 
@@ -104,6 +116,7 @@ def managed_files(settings: Settings | None = None) -> list[Path]:
         SETTINGS_PATH, SECRETS_PATH, SERVER_CONFIG_PATH, ARGO_TOKEN_PATH, DDNS_TOKEN_PATH,
         CERTIFICATE_PATH, KEY_PATH, STATE_PATH, FIREWALL_STATE_PATH, CERTIFICATE_STATE_PATH,
         CERTIFICATES_STATE_PATH, DDNS_STATE_PATH, ARGO_STATE_PATH, ARGO_LOG_PATH, CORE_STATE_PATH,
+        SUBSCRIPTION_CONFIG_PATH, SUBSCRIPTION_TOKEN_PATH,
         SYSCTL_PATH, Path("/usr/local/bin/sbox5"), SINGBOX_BINARY, CLOUDFLARED_BINARY,
         *(UNIT_DIR / name for name in UNITS),
     }
@@ -123,7 +136,8 @@ def _managed_directories(settings: Settings | None = None) -> list[Path]:
     directories = [
         CONFIG_DIR, CONFIG_DIR / "secrets", CONFIG_DIR / "tls", CONFIG_DIR / "tls" / "default",
         STATE_DIR, SNAPSHOT_ROOT, STATE_DIR / "ddns", STATE_DIR / "exports", ACME_STATE_DIR,
-        ACME_STATE_DIR / "default", ARGO_DIR, RULESET_DIR, Path("/var/lib/sbox5-runtime"),
+        ACME_STATE_DIR / "default", ARGO_DIR, RULESET_DIR, SUBSCRIPTION_BUNDLE_DIR, SUBSCRIPTION_TLS_DIR,
+        Path("/var/lib/sbox5-runtime"),
         Path("/usr/local/libexec/sbox5"), Path("/usr/local/libexec/sbox5/app"), BINARY_DIR, CORE_CACHE_DIR,
     ]
     if settings is not None:
@@ -148,6 +162,7 @@ class InstallTransaction:
         argo_token: str = "",
         import_files: dict[str, tuple[Path, Path]] | None = None,
         rule_set_files: dict[str, Path] | None = None,
+        subscription_token: str = "",
     ) -> None:
         self.project_root = project_root.resolve()
         self.settings = settings
@@ -159,6 +174,7 @@ class InstallTransaction:
         self.argo_token = argo_token
         self.import_files = dict(import_files or {})
         self.rule_set_files = dict(rule_set_files or {})
+        self.subscription_token = subscription_token
         self.snapshot: Snapshot | None = None
         self.previous_state: dict[str, Any] = {}
         self.previous_settings: Settings | None = None
@@ -211,6 +227,8 @@ class InstallTransaction:
             requested.append("sbox5-ddns")
         if self.settings.argo.enabled:
             requested.append("sbox5-argo")
+        if self.settings.subscription.enabled:
+            requested.append("sbox5-sub")
         if self.upgrade or self.reconfigure:
             requested = sorted(set(requested + self.previous_state.get("users", [])))
         for name in requested:
@@ -284,6 +302,60 @@ class InstallTransaction:
                 raise ConfigError(tr(f"Rule-set SHA256 mismatch: {item.tag}", f"规则集 SHA256 不符：{item.tag}"))
             self._write(destination, data, 0o640, uid, gid)
 
+    def _prepare_subscription(self, uid: int, gid: int) -> None:
+        if not self.settings.subscription.enabled:
+            self._remove(SUBSCRIPTION_CONFIG_PATH)
+            self._remove(SUBSCRIPTION_TOKEN_PATH)
+            for name in SUBSCRIPTION_FILES:
+                self._remove(SUBSCRIPTION_BUNDLE_DIR / name)
+            self._remove(SUBSCRIPTION_TLS_DIR / "cert.pem")
+            self._remove(SUBSCRIPTION_TLS_DIR / "key.pem")
+            return
+        token = self.subscription_token.strip()
+        if not token and SUBSCRIPTION_TOKEN_PATH.is_file() and not SUBSCRIPTION_TOKEN_PATH.is_symlink():
+            token = SUBSCRIPTION_TOKEN_PATH.read_text(encoding="utf-8").strip()
+        if not token:
+            token = generate_token()
+        if len(token) < 16 or len(token) > 256 or any(char in token for char in "\r\n\x00"):
+            raise ConfigError(tr("The subscription token is invalid", "订阅 Token 无效"))
+        self._write(SUBSCRIPTION_TOKEN_PATH, (token + "\n").encode(), 0o600)
+        self._mkdir(SUBSCRIPTION_BUNDLE_DIR, 0o700, uid, gid)
+        self._mkdir(SUBSCRIPTION_TLS_DIR, 0o700, uid, gid)
+        tls: dict[str, str] = {}
+        if self.settings.subscription.tls_profile:
+            profile = certificate_profile(self.settings, self.settings.subscription.tls_profile)
+            if profile.mode not in ("self-signed", "imported"):
+                raise ConfigError(tr("The subscription TLS profile must be self-signed or imported", "订阅 TLS 配置必须是自签或导入证书"))
+            certificate = profile_certificate_path(profile)
+            key = profile_key_path(profile)
+            if not certificate.is_file() or not key.is_file():
+                raise ConfigError(tr("The subscription TLS certificate files are missing", "订阅 TLS 证书文件缺失"))
+            self._write(SUBSCRIPTION_TLS_DIR / "cert.pem", certificate.read_bytes(), 0o640, uid, gid)
+            self._write(SUBSCRIPTION_TLS_DIR / "key.pem", key.read_bytes(), 0o600, uid, gid)
+            tls = {
+                "certificate_path": str(SUBSCRIPTION_TLS_DIR / "cert.pem"),
+                "key_path": str(SUBSCRIPTION_TLS_DIR / "key.pem"),
+            }
+        else:
+            self._remove(SUBSCRIPTION_TLS_DIR / "cert.pem")
+            self._remove(SUBSCRIPTION_TLS_DIR / "key.pem")
+        config = {
+            "schema_version": 1,
+            "bind": self.settings.subscription.bind,
+            "port": self.settings.subscription.port,
+            "bundle_dir": str(SUBSCRIPTION_BUNDLE_DIR),
+            "token_sha256": token_hash(token),
+            "tls": tls,
+            "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+        self._json(SUBSCRIPTION_CONFIG_PATH, config, 0o640, 0, gid)
+        for name in SUBSCRIPTION_FILES:
+            source = EXPORT_DIR / name
+            if source.is_file() and not source.is_symlink():
+                self._write(SUBSCRIPTION_BUNDLE_DIR / name, source.read_bytes(), 0o640, uid, gid)
+            else:
+                self._remove(SUBSCRIPTION_BUNDLE_DIR / name)
+
     def _configure_sysctl(self) -> None:
         assert self.snapshot is not None
         previous_records = self.previous_state.get("sysctls", [])
@@ -320,6 +392,8 @@ class InstallTransaction:
             desired["sbox5-ddns.timer"] = ddns_timer(self.settings.ddns.interval_seconds)
         if needs_firewall_service(self.settings):
             desired["sbox5-firewall.service"] = firewall_unit()
+        if self.settings.subscription.enabled:
+            desired["sbox5-subscription.service"] = subscription_unit()
         for name in UNITS:
             path = UNIT_DIR / name
             if name in desired:
@@ -392,6 +466,12 @@ class InstallTransaction:
                     self._write(ARGO_LOG_PATH, b"", 0o600, argo_uid, argo_gid)
                 else:
                     self._remove(ARGO_LOG_PATH)
+            if self.settings.subscription.enabled:
+                subscription_uid, subscription_gid = identity("sbox5-sub")
+                self._mkdir(SUBSCRIPTION_BUNDLE_DIR, 0o700, subscription_uid, subscription_gid)
+                self._mkdir(SUBSCRIPTION_TLS_DIR, 0o700, subscription_uid, subscription_gid)
+            else:
+                subscription_uid, subscription_gid = 0, 0
             self._mkdir(STATE_DIR, 0o711)
             self._mkdir(SNAPSHOT_ROOT, 0o700)
             self._mkdir(EXPORT_DIR, 0o700)
@@ -519,6 +599,7 @@ class InstallTransaction:
                 if path.is_file():
                     self._record(path)
             check_server_config(SINGBOX_BINARY, EXPORT_DIR / "sing-box-client.json")
+            check_server_config(SINGBOX_BINARY, EXPORT_DIR / "sfa.json")
             self._configure_sysctl()
             self._install_units()
             if (UNIT_DIR / "sbox5-firewall.service").exists():
@@ -556,9 +637,14 @@ class InstallTransaction:
                         if path.is_file():
                             self._record(path)
                     check_server_config(SINGBOX_BINARY, EXPORT_DIR / "sing-box-client.json")
+                    check_server_config(SINGBOX_BINARY, EXPORT_DIR / "sfa.json")
             else:
                 self._remove(ARGO_STATE_PATH)
                 self._remove(ARGO_LOG_PATH)
+            self._prepare_subscription(subscription_uid, subscription_gid)
+            if self.settings.subscription.enabled:
+                enable_start("sbox5-subscription.service")
+                require_active("sbox5-subscription.service")
             if self.settings.ddns.enabled:
                 run(["systemctl", "start", "sbox5-ddns.service"], timeout=180)
                 self._record(DDNS_STATE_PATH)
@@ -583,6 +669,8 @@ class InstallTransaction:
                 "warp": self.settings.warp.as_dict(),
                 "warp_credential": self.secrets.warp.public_state(),
                 "routing": self.settings.routing.as_dict(),
+                "cdn": self.settings.cdn.as_dict(),
+                "subscription": self.settings.subscription.as_dict(),
                 "packages": self.snapshot.manifest["packages"],
                 "managed_files": [entry["path"] for entry in self.snapshot.manifest["files"] if Path(entry["path"]).exists()],
                 "snapshot_id": self.snapshot.manifest["snapshot_id"],
@@ -629,10 +717,12 @@ def reconfigure(
     import_files: dict[str, tuple[Path, Path]] | None = None,
     rule_set_files: dict[str, Path] | None = None,
     argo_token: str = "",
+    subscription_token: str = "",
 ) -> dict[str, Any]:
     settings.validate()
     secrets.validate()
     return InstallTransaction(
         project_root, settings, secrets, upgrade=True, reconfigure=True, feature=feature,
         import_files=import_files, rule_set_files=rule_set_files, argo_token=argo_token,
+        subscription_token=subscription_token,
     ).run()

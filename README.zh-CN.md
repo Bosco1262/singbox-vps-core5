@@ -5,7 +5,7 @@
 [![License: GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://www.python.org/)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Debian%2012%2B%20%7C%20Ubuntu%2022.04%2B-orange.svg)]()
-[![Tests: 61 Passed](https://img.shields.io/badge/Tests-61%20Passed-brightgreen.svg)]()
+[![Tests: 73 Passed](https://img.shields.io/badge/Tests-73%20Passed-brightgreen.svg)]()
 
 **singbox-vps-core5** (`sbox5`) 是一个面向 Linux VPS 的生产加固、可审计且支持故障回滚的多协议代理套件。在严苛的安全隔离、非 root systemd 沙盒与不可变供应链锁的保护下，实现五大现代协议（**VLESS-Reality**、**VMess-WS**、**Hysteria2**、**TUIC v5** 与 **AnyTLS**）的原生平滑共存。
 
@@ -15,7 +15,7 @@
 
 - **五协议原生共存**：单机同时运行 VLESS-Reality、VMess-WebSocket（可选 TLS）、Hysteria2（含 Salamander 混淆）、TUIC v5 与 AnyTLS，互不干扰；每个协议可独立启停；
 - **原生 ACME 与按协议 TLS**：使用 sing-box 原生 ACME certificate provider（HTTP-01 / TLS-ALPN-01 / DNS-01，CA 支持时可申请 IP 证书），按协议绑定 TLS 配置；不再依赖 certbot，也不需要外部续期定时器；
-- **非 root 权限隔离**：核心服务分别运行于专用系统账户（`sbox5`、`sbox5-argo`、`sbox5-ddns`），彻底废除特权执行；
+- **非 root 权限隔离**：核心服务分别运行于专用系统账户（`sbox5`、`sbox5-argo`、`sbox5-ddns`、`sbox5-sub`），彻底废除特权执行；
 - **供应链哈希硬锁**：通过 `locks/*.json` 硬编码官方下载源与 SHA256，流式校验哈希与归档结构，杜绝上游静默投毒；
 - **零外部库依赖**：纯 Python 3.10+ 标准库实现，无需 `pip install`，无外部脚本远程管道执行；
 - **原子事务与快照回滚**：安装、升级、重新配置、卸载前自动捕获系统快照（配置、防火墙、用户、sysctl），失败全自动回滚，快照自带离线无依赖 `restore.py`；
@@ -23,6 +23,11 @@
 - **双源交叉验证 DDNS**：对接 Cloudflare API，至少由两个独立 HTTPS 端点交叉确认公网 IP 后方可写入，强制 `proxied: false`；
 - **最小权限防火墙接管**：优先适配既有 UFW，或建立独立 `inet sbox5` 表；iptables 回退方案使用隔离的 `SBOX5-INPUT` / `SBOX5-PREROUTING` 自定义链，绝不执行全局 `iptables -F` 或清空宿主规则；
 - **Hysteria2 / TUIC UDP 端口跳跃**：在独立防火墙表/链中声明式维护 UDP 范围并精确回滚；TUIC 没有标准端口范围 URI 字段，客户端需选择具体端口；
+- **Argo Quick/Token 隧道**：`cloudflared` 临时隧道与固定 Token 隧道由加固的非 root 服务托管；专用回环 VMess 入口让 Argo 与公网 VMess TLS 共存；
+- **原生 WARP 与多目标分流**：WARP 凭证通过 Cloudflare 客户端注册端点或手动导入（绝不使用共享私钥）；域名后缀与本地 `.srs` 规则集可分流到 WARP、本地 IPv4/IPv6 或可选 Socks5 出站；
+- **CDN 优选与全客户端导出**：支持 VMess/Argo 的 CDN 优选 IP/域名与显式 Host/SNI；导出 SFA、SFI、SFW、sing-box、Mihomo、分享链接、二维码与 Base64 订阅包；
+- **本地订阅服务**：独立低权限 `sbox5-sub` 服务，仅通过高熵路径 Token 提供白名单文件；服务端只保存 Token 哈希；默认 localhost + TLS 反向代理，也可用自签/导入证书启用内置 TLS；
+- **锁定内核生命周期**：稳定版/通道/指定版本切换只接受不可变锁文件，新二进制先通过 `sing-box check`，失败自动回滚；
 - **客户端零降级证书校验**：自签证书内嵌公钥，Mihomo 绑定完整 DER SHA256 指纹，彻底杜绝 `insecure: true` 风险。
 
 ---
@@ -80,6 +85,8 @@ sbox5 <subcommand>
   warp         注册、导入、轮换、启停或清除 WARP
   route        管理域名分流、Socks5 与本地 .srs 规则集
   core         查看、列出、切换或回滚已锁定 sing-box 版本
+  cdn          设置或清除 VMess/Argo CDN 优选地址与 Host/SNI
+  subscription 管理本地 Token 订阅服务
   snapshots    列出本地历史快照与提交状态
   rollback     使用快照附带的独立恢复器一键回滚系统
   uninstall    安全卸载（自动拍摄快照，清理规则与文件，保留软件包）
@@ -130,7 +137,8 @@ sbox5 <subcommand>
 /var/lib/sbox5/exports/
 ├── links.txt                # 通用分享链接 (vless://, vmess://, hysteria2://, tuic://, anytls://)
 ├── subscription-base64.txt  # Base64 编码订阅文本
-├── sing-box-client.json     # 官方 sing-box 完整客户端配置 (已内联自签公钥)
+├── sing-box-client.json     # 官方 sing-box mixed 入站客户端配置
+├── sfa.json / sfi.json / sfw.json  # Android/iOS/Windows 的 sing-box TUN 配置
 ├── mihomo.yaml              # Mihomo (Clash.Meta) 完整配置 (已绑定 DER SHA256 指纹)
 ├── metadata.json            # 导出元数据与证书校验警告
 ├── certificate*.pem         # 自签/导入的公开证书，用于指纹固定
@@ -158,12 +166,13 @@ Host System (Debian 12 / Ubuntu 22.04)
  │    ├── settings.json             (0600 / 0640)
  │    ├── tls/ [cert.pem, key.pem]  (0750 dir, key: 0600, sbox5:sbox5)
  │    ├── tls/<profile>/            (额外证书配置)
- │    └── secrets/ [argo, ddns, protocols] (0711 dir, tokens: 0600)
+ │    └── secrets/ [argo, ddns, protocols, subscription] (0711 dir, tokens: 0600)
  ├── /var/lib/sbox5/
  │    ├── acme/<profile>/           (0700, sing-box 原生 ACME 状态)
  │    ├── certificates.json         (按证书配置保存的状态)
  │    ├── argo/                     (state.json 与临时隧道日志)
  │    ├── rulesets/                 (本地 .srs 规则集)
+ │    ├── subscription/             (0700, Token 化订阅包与可选 TLS)
  │    ├── core.json                 (当前/上一版内核)
  │    ├── snapshots/                (0700, 独立快照存储)
  │    └── exports/                  (0700, 客户端配置文件)
@@ -171,6 +180,7 @@ Host System (Debian 12 / Ubuntu 22.04)
       ├── sbox5.service             (User=sbox5, hardened systemd sandbox, native ACME)
       ├── sbox5-argo.service        (User=sbox5-argo, quick 或 token 隧道)
       ├── sbox5-ddns.timer          (User=sbox5-ddns, dual-source check)
+      ├── sbox5-subscription.service(User=sbox5-sub, Token 化本地订阅)
       └── sbox5-firewall.service    (Minimal rule enforcement, no flush)
 ```
 
@@ -205,19 +215,46 @@ sudo sbox5 route list
 sudo sbox5 core list
 sudo sbox5 core switch --channel stable --yes
 sudo sbox5 core rollback --yes
+
+# VMess/Argo CDN 优选
+sudo sbox5 cdn set --target vmess --address 104.16.0.1 --host cdn.example.com --sni cdn.example.com --yes
+sudo sbox5 cdn set --target argo --address 104.16.0.1 --yes
+sudo sbox5 cdn list
+
+# 本地订阅服务（推荐 localhost + TLS 反向代理）
+sudo sbox5 subscription set --bind 127.0.0.1 --port 18090 --yes
+sudo sbox5 subscription url
+sudo sbox5 subscription rotate --yes
+
+# 可选：使用自签/导入证书配置启用内置 TLS
+sudo sbox5 subscription set --bind 0.0.0.0 --port 18090 --tls-profile default --yes
 ```
 
-WARP 注册使用 Cloudflare 客户端注册端点，失败会显式报错，绝不会回退到硬编码/共享私钥；仍可使用手动导入。WARP 私钥保存在 `secrets/protocols.json`（`0600`），并会注入 `config.json`（`0640 root:sbox5`），因为 sing-box 运行时需要读取。内核只接受已锁定版本；切换测试版前需添加 `locks/versions/<version>.json` 并在 `locks/versions/index.json` 设置 `channels.beta`。
+VMess CDN 要求源站 VMess 入站保持明文 WebSocket；Argo CDN 要求 token 模式，因为临时隧道域名会变化。
+
+订阅服务只暴露白名单文件：
+
+```text
+/sub/<token>/links       /sub/<token>/base64
+/sub/<token>/sing-box    /sub/<token>/sfa | sfi | sfw
+/sub/<token>/mihomo      /sub/<token>/clash
+/sub/<token>/metadata
+```
+
+本地订阅进程无法读取原生 ACME 证书；ACME 请使用 TLS 反向代理，或使用自签/导入证书配置启用内置 TLS。原始 Token 只保存在 `/etc/sbox5/secrets/subscription.token`（`0600`），服务配置只保存其 SHA256 哈希。
+
+WARP 注册使用 Cloudflare 客户端注册端点，绝不会回退到硬编码/共享私钥；WARP 私钥保存在 `secrets/protocols.json`（`0600`），并会注入 `config.json`（`0640 root:sbox5`）。内核只接受已锁定版本；切换测试版前需添加 `locks/versions/<version>.json` 并在 `locks/versions/index.json` 设置 `channels.beta`。
 
 ---
 
-## MVP → Phase 2 迁移说明
+## MVP → Phase 3 迁移说明
 
 - `settings.json` / `state.json` 会自动从 schema v1/v2 迁移到 v3；原有 v1/v2 快照仍由其自带的 `restore.py` 恢复。
 - 旧的 certbot ACME 配置会迁移为 sing-box 原生 ACME，默认使用 HTTP-01。旧 `/etc/sbox5/acme` 状态会保留但不再使用；sing-box 会在下次启动时重新签发证书。
 - 原有协议端口与凭据保持不变；TUIC/Hysteria2 跳跃范围会通过新的防火墙 reconcile 路径重新下发。
 - 原有 Argo 配置会迁移为 token 模式并保留域名。Argo 现在使用回环 VMess 入口（默认 `18081`），因此 VMess TLS 与 Argo 可以共存；请将 Cloudflare ingress 更新为 `http://127.0.0.1:18081`。
 - Phase 2 新增原生 WARP、可选 Socks5、本地 `.srs` 规则集与锁定内核切换；`warp-plus` / Psiphon 仍明确排除。
+- Phase 3 新增 CDN 优选、SFA/SFI/SFW 导出与**仅本地**订阅服务。按设计不包含 GitLab/Telegram 推送；请通过自己的 HTTPS 反向代理发布带 Token 的订阅 URL。
 
 ---
 

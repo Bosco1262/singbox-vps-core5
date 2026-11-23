@@ -37,6 +37,8 @@ def required_ports(settings: Settings) -> list[dict[str, Any]]:
             ports.append({"port": 80, "protocol": "tcp", "name": f"acme-http-{profile.id}"})
         elif profile.challenge == "tls-alpn-01":
             ports.append({"port": 443, "protocol": "tcp", "name": f"acme-tls-{profile.id}"})
+    if settings.subscription.enabled and settings.subscription.bind == "0.0.0.0":
+        ports.append({"port": settings.subscription.port, "protocol": "tcp", "name": "subscription"})
     result: list[dict[str, Any]] = []
     seen: set[tuple[int, str]] = set()
     for item in ports:

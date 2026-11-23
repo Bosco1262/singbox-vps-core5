@@ -218,7 +218,7 @@ class KernelTests(unittest.TestCase):
 
 class Phase2CommandTests(unittest.TestCase):
     def test_command_handlers_exist(self):
-        for name in ("_certificate", "_argo", "_warp", "_route", "_core"):
+        for name in ("_certificate", "_argo", "_warp", "_route", "_core", "_cdn", "_subscription"):
             self.assertTrue(callable(getattr(cli_module, name, None)), name)
 
     def test_new_commands_parse(self):
@@ -237,6 +237,12 @@ class Phase2CommandTests(unittest.TestCase):
         self.assertEqual((ruleset.ruleset_command, ruleset.tag), ("add", "cn"))
         core = parser.parse_args(["core", "switch", "--channel", "stable", "--yes"])
         self.assertEqual((core.core_command, core.channel), ("switch", "stable"))
+        cdn = parser.parse_args(["cdn", "set", "--target", "vmess", "--address", "104.16.0.1", "--host", "cdn.example.com", "--yes"])
+        self.assertEqual((cdn.cdn_command, cdn.target), ("set", "vmess"))
+        subscription = parser.parse_args(["subscription", "set", "--bind", "127.0.0.1", "--port", "18090", "--yes"])
+        self.assertEqual((subscription.subscription_command, subscription.port), ("set", 18090))
+        serve = parser.parse_args(["subscription-serve", "--non-interactive"])
+        self.assertTrue(serve.non_interactive)
 
 
 if __name__ == "__main__":

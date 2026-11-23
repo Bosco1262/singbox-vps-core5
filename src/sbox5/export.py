@@ -70,32 +70,43 @@ def build_client_outbounds(
             },
         })
     if settings.protocols["vmess"].enabled:
+        cdn = settings.cdn.vmess
         vmess: dict[str, Any] = {
             "type": "vmess",
             "tag": "vmess",
-            "server": host,
-            "server_port": settings.ports.vmess,
+            "server": cdn.address if cdn.enabled else host,
+            "server_port": cdn.port if cdn.enabled else settings.ports.vmess,
             "uuid": secrets.vmess_uuid,
             "security": "auto",
             "alter_id": 0,
             "transport": {"type": "ws", "path": secrets.vmess_path, "max_early_data": 0},
         }
-        profile = _profile_for(settings, "vmess")
-        if profile is not None:
-            pem = certificate_pems.get(profile.id, certificate_pem if profile.id == "default" else "")
-            vmess["tls"] = _client_tls(profile, pem, ["h2", "http/1.1"])
+        if cdn.enabled:
+            vmess["transport"]["headers"] = {"Host": cdn.host}
+            vmess["tls"] = {"enabled": True, "server_name": cdn.sni}
+        else:
+            profile = _profile_for(settings, "vmess")
+            if profile is not None:
+                pem = certificate_pems.get(profile.id, certificate_pem if profile.id == "default" else "")
+                vmess["tls"] = _client_tls(profile, pem, ["h2", "http/1.1"])
         inbounds.append(vmess)
         if settings.argo.enabled and resolved_argo_host:
+            argo_cdn = settings.cdn.argo
             inbounds.append({
                 "type": "vmess",
                 "tag": "vmess-argo",
-                "server": resolved_argo_host,
-                "server_port": 443,
+                "server": argo_cdn.address if argo_cdn.enabled else resolved_argo_host,
+                "server_port": argo_cdn.port if argo_cdn.enabled else 443,
                 "uuid": secrets.vmess_uuid,
                 "security": "auto",
                 "alter_id": 0,
-                "tls": {"enabled": True, "server_name": resolved_argo_host},
-                "transport": {"type": "ws", "path": secrets.vmess_path, "headers": {"Host": resolved_argo_host}, "max_early_data": 0},
+                "tls": {"enabled": True, "server_name": argo_cdn.sni if argo_cdn.enabled else resolved_argo_host},
+                "transport": {
+                    "type": "ws",
+                    "path": secrets.vmess_path,
+                    "headers": {"Host": argo_cdn.host if argo_cdn.enabled else resolved_argo_host},
+                    "max_early_data": 0,
+                },
             })
     if settings.protocols["hysteria2"].enabled:
         profile = _profile_for(settings, "hysteria2")
@@ -165,6 +176,39 @@ def build_singbox_client(
     }
 
 
+def build_tun_client(
+    settings: Settings,
+    secrets: Secrets,
+    certificate_pem: str,
+    certificate_pems: dict[str, str] | None = None,
+    argo_host: str = "",
+    platform: str = "sfa",
+) -> dict[str, Any]:
+    outbounds = build_client_outbounds(settings, secrets, certificate_pem, certificate_pems, argo_host)
+    final = outbounds[0]["tag"] if outbounds else "direct"
+    stack = "system" if platform == "sfi" else "mixed"
+    return {
+        "log": {"level": "info", "timestamp": True},
+        "dns": {"servers": [{"type": "local", "tag": "local"}], "final": "local"},
+        "inbounds": [{
+            "type": "tun",
+            "tag": "tun-in",
+            "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+            "mtu": 9000,
+            "auto_route": True,
+            "strict_route": False,
+            "stack": stack,
+        }],
+        "outbounds": outbounds + [{"type": "direct", "tag": "direct"}],
+        "route": {
+            "rules": [{"action": "sniff"}],
+            "final": final,
+            "default_domain_resolver": "local",
+            "auto_detect_interface": True,
+        },
+    }
+
+
 def _url(scheme: str, userinfo: str, host: str, port: int | str, query: dict[str, Any], name: str) -> str:
     authority = format_host_port(host, port)  # type: ignore[arg-type]
     return f"{scheme}://{userinfo}@{authority}?{urlencode(query)}#{quote(name)}"
@@ -194,21 +238,32 @@ def build_share_links(
             "fp": "chrome", "pbk": secrets.reality_public_key, "sid": secrets.reality_short_id, "type": "tcp",
         }, "sbox5-vless")
     if settings.protocols["vmess"].enabled:
+        cdn = settings.cdn.vmess
         vmess = {
-            "v": "2", "ps": "sbox5-vmess", "add": host, "port": str(settings.ports.vmess),
+            "v": "2", "ps": "sbox5-vmess", "add": cdn.address if cdn.enabled else host,
+            "port": str(cdn.port if cdn.enabled else settings.ports.vmess),
             "id": secrets.vmess_uuid, "aid": "0", "scy": "auto", "net": "ws", "type": "none",
-            "host": "", "path": secrets.vmess_path, "tls": "",
+            "host": cdn.host if cdn.enabled else "", "path": secrets.vmess_path,
+            "tls": "tls" if cdn.enabled else "",
         }
-        profile = _profile_for(settings, "vmess")
-        if profile is not None:
-            vmess["tls"] = "tls"
-            vmess["sni"] = profile.server_name
-            vmess["host"] = profile.server_name
+        if cdn.enabled:
+            vmess["sni"] = cdn.sni
+        else:
+            profile = _profile_for(settings, "vmess")
+            if profile is not None:
+                vmess["tls"] = "tls"
+                vmess["sni"] = profile.server_name
+                vmess["host"] = profile.server_name
         links["vmess"] = "vmess://" + base64.b64encode(json.dumps(vmess, ensure_ascii=False, separators=(",", ":")).encode()).decode()
         if settings.argo.enabled and resolved_argo_host:
+            argo_cdn = settings.cdn.argo
             argo_vmess = {
-                **vmess, "ps": "sbox5-vmess-argo", "add": resolved_argo_host, "port": "443",
-                "host": resolved_argo_host, "sni": resolved_argo_host, "tls": "tls",
+                **vmess, "ps": "sbox5-vmess-argo",
+                "add": argo_cdn.address if argo_cdn.enabled else resolved_argo_host,
+                "port": str(argo_cdn.port if argo_cdn.enabled else 443),
+                "host": argo_cdn.host if argo_cdn.enabled else resolved_argo_host,
+                "sni": argo_cdn.sni if argo_cdn.enabled else resolved_argo_host,
+                "tls": "tls",
             }
             links["vmess-argo"] = "vmess://" + base64.b64encode(json.dumps(argo_vmess, ensure_ascii=False, separators=(",", ":")).encode()).decode()
     if settings.protocols["hysteria2"].enabled:
@@ -274,25 +329,42 @@ def build_mihomo(
             "reality-opts": {"public-key": secrets.reality_public_key, "short-id": secrets.reality_short_id},
         })
     if settings.protocols["vmess"].enabled:
+        cdn = settings.cdn.vmess
         vmess: dict[str, Any] = {
-            "name": "sbox5-vmess", "type": "vmess", "server": host, "port": settings.ports.vmess,
+            "name": "sbox5-vmess", "type": "vmess",
+            "server": cdn.address if cdn.enabled else host,
+            "port": cdn.port if cdn.enabled else settings.ports.vmess,
             "uuid": secrets.vmess_uuid, "alterId": 0, "cipher": "auto", "network": "ws", "udp": True,
             "ws-opts": {"path": secrets.vmess_path},
         }
-        profile = _profile_for(settings, "vmess")
-        if profile is not None:
-            metadata = _mihomo_certificate(settings, profile, certificate, certificates)
-            vmess.update({
-                "tls": True, "servername": profile.server_name, "skip-cert-verify": False,
-                **({"fingerprint": metadata["certificate_fingerprint"]} if profile.mode != "acme" and metadata.get("certificate_fingerprint") else {}),
-            })
+        if cdn.enabled:
+            vmess["tls"] = True
+            vmess["servername"] = cdn.sni
+            vmess["skip-cert-verify"] = False
+            vmess["ws-opts"]["headers"] = {"Host": cdn.host}
+        else:
+            profile = _profile_for(settings, "vmess")
+            if profile is not None:
+                metadata = _mihomo_certificate(settings, profile, certificate, certificates)
+                vmess.update({
+                    "tls": True, "servername": profile.server_name, "skip-cert-verify": False,
+                    **({"fingerprint": metadata["certificate_fingerprint"]} if profile.mode != "acme" and metadata.get("certificate_fingerprint") else {}),
+                })
         proxies.append(vmess)
         if settings.argo.enabled and resolved_argo_host:
+            argo_cdn = settings.cdn.argo
             proxies.append({
-                "name": "sbox5-vmess-argo", "type": "vmess", "server": resolved_argo_host, "port": 443,
+                "name": "sbox5-vmess-argo", "type": "vmess",
+                "server": argo_cdn.address if argo_cdn.enabled else resolved_argo_host,
+                "port": argo_cdn.port if argo_cdn.enabled else 443,
                 "uuid": secrets.vmess_uuid, "alterId": 0, "cipher": "auto", "network": "ws", "udp": True,
-                "tls": True, "servername": resolved_argo_host, "skip-cert-verify": False,
-                "ws-opts": {"path": secrets.vmess_path, "headers": {"Host": resolved_argo_host}},
+                "tls": True,
+                "servername": argo_cdn.sni if argo_cdn.enabled else resolved_argo_host,
+                "skip-cert-verify": False,
+                "ws-opts": {
+                    "path": secrets.vmess_path,
+                    "headers": {"Host": argo_cdn.host if argo_cdn.enabled else resolved_argo_host},
+                },
             })
     if settings.protocols["hysteria2"].enabled:
         profile = _profile_for(settings, "hysteria2")
@@ -398,7 +470,10 @@ def export_nodes(
     qr_files: list[str] = []
     if available("qrencode"):
         qr_files = [f"{protocol}.png" for protocol in links]
-    expected = {"links.txt", "subscription-base64.txt", "sing-box-client.json", "mihomo.yaml", "metadata.json", *qr_files, *certificate_files}
+    expected = {
+        "links.txt", "subscription-base64.txt", "sing-box-client.json", "sfa.json", "sfi.json", "sfw.json",
+        "mihomo.yaml", "metadata.json", *qr_files, *certificate_files,
+    }
     for path in list(destination.iterdir()):
         if path.name not in expected:
             if path.is_symlink() or not path.is_file():
@@ -412,6 +487,12 @@ def export_nodes(
         build_singbox_client(settings, secrets, default_pem, certificate_pems, resolved_argo_host),
         0o600,
     )
+    for platform in ("sfa", "sfi", "sfw"):
+        atomic_json(
+            destination / f"{platform}.json",
+            build_tun_client(settings, secrets, default_pem, certificate_pems, resolved_argo_host, platform),
+            0o600,
+        )
     atomic_text(destination / "mihomo.yaml", yaml_dump(build_mihomo(settings, secrets, certificate, certificates, resolved_argo_host)) + "\n", 0o600)
     for profile in settings.active_certificate_profiles():
         if profile.mode == "acme":

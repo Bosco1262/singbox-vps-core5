@@ -57,7 +57,7 @@ def uninstall(args: argparse.Namespace) -> int:
                 snapshot.manifest["firewall"]["owned"].append({**resource, "action": "remove"})
     users_removed = []
     for name in state.get("users", []):
-        if name not in ("sbox5", "sbox5-ddns", "sbox5-argo"):
+        if name not in ("sbox5", "sbox5-ddns", "sbox5-argo", "sbox5-sub"):
             raise ConflictError(tr(f"The state file contains a user outside this project: {name}", f"状态文件包含非项目用户：{name}"))
         try:
             account = pwd.getpwnam(name)

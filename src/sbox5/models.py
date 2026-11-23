@@ -521,6 +521,116 @@ class RoutingSettings:
 
 
 @dataclass
+class CdnProfile:
+    enabled: bool = False
+    address: str = ""
+    port: int = 443
+    host: str = ""
+    sni: str = ""
+
+    def validate(self, label: str) -> None:
+        if not self.enabled:
+            return
+        if not self.address:
+            raise ConfigError(tr(f"{label} CDN requires a preferred IP or domain", f"{label} CDN 需要优选 IP 或域名"))
+        self.address = normalize_host(self.address)
+        self.port = validate_port(self.port)
+        if not self.host:
+            try:
+                ipaddress.ip_address(self.address)
+            except ValueError:
+                self.host = self.address
+            else:
+                raise ConfigError(tr(f"{label} CDN with an IP address requires an explicit Host/SNI", f"{label} CDN 使用 IP 时必须显式提供 Host/SNI"))
+        self.host = validate_hostname(self.host, tr(f"{label} CDN Host", f"{label} CDN Host"))
+        self.sni = validate_hostname(self.sni or self.host, tr(f"{label} CDN SNI", f"{label} CDN SNI"))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "address": self.address,
+            "port": self.port,
+            "host": self.host,
+            "sni": self.sni,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "CdnProfile":
+        return cls(
+            enabled=bool(value.get("enabled", False)),
+            address=str(value.get("address", "")),
+            port=int(value.get("port", 443)),
+            host=str(value.get("host", "")),
+            sni=str(value.get("sni", "")),
+        )
+
+
+@dataclass
+class CdnSettings:
+    vmess: CdnProfile = field(default_factory=CdnProfile)
+    argo: CdnProfile = field(default_factory=CdnProfile)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"vmess": self.vmess.as_dict(), "argo": self.argo.as_dict()}
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "CdnSettings":
+        return cls(
+            vmess=CdnProfile.from_dict(value.get("vmess", {})),
+            argo=CdnProfile.from_dict(value.get("argo", {})),
+        )
+
+
+@dataclass
+class SubscriptionSettings:
+    enabled: bool = False
+    bind: str = "127.0.0.1"
+    port: int = 18090
+    tls_profile: str = ""
+
+    def validate(self, profiles: dict[str, CertificateProfile]) -> None:
+        if not self.enabled:
+            return
+        self.bind = self.bind.strip()
+        if self.bind not in ("127.0.0.1", "0.0.0.0"):
+            raise ConfigError(tr("Subscription bind must be 127.0.0.1 or 0.0.0.0", "订阅服务绑定地址必须是 127.0.0.1 或 0.0.0.0"))
+        self.port = validate_port(self.port)
+        if self.port < 1024:
+            raise ConfigError(tr("The subscription port must be 1024 or higher", "订阅端口必须大于等于 1024"))
+        if self.tls_profile:
+            profile = profiles.get(self.tls_profile)
+            if profile is None:
+                raise ConfigError(tr("The subscription TLS profile does not exist", "订阅 TLS 配置不存在"))
+            if profile.mode == "acme":
+                raise ConfigError(tr(
+                    "Native ACME certificates cannot be used by the local subscription server; use a self-signed/imported profile or a reverse proxy",
+                    "本地订阅服务不能使用原生 ACME 证书；请使用自签/导入证书配置或反向代理",
+                ))
+        if self.bind == "0.0.0.0" and not self.tls_profile:
+            raise ConfigError(tr(
+                "A public subscription listener requires TLS; bind 127.0.0.1 and use a reverse proxy for ACME",
+                "公网订阅监听必须启用 TLS；建议绑定 127.0.0.1 并使用反向代理处理 ACME",
+            ))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "bind": self.bind,
+            "port": self.port,
+            "tls_profile": self.tls_profile,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "SubscriptionSettings":
+        return cls(
+            enabled=bool(value.get("enabled", False)),
+            bind=str(value.get("bind", "127.0.0.1")),
+            port=int(value.get("port", 18090)),
+            tls_profile=str(value.get("tls_profile", "")),
+        )
+
+
+@dataclass
 class ArgoSettings:
     enabled: bool = False
     mode: str = "token"
@@ -576,6 +686,8 @@ class Settings:
     argo: ArgoSettings = field(default_factory=ArgoSettings)
     warp: WarpSettings = field(default_factory=WarpSettings)
     routing: RoutingSettings = field(default_factory=RoutingSettings)
+    cdn: CdnSettings = field(default_factory=CdnSettings)
+    subscription: SubscriptionSettings = field(default_factory=SubscriptionSettings)
     schema_version: int = 2
     protocols: dict[str, ProtocolSettings] = field(default_factory=default_protocols)
     certificate_profiles: list[CertificateProfile] = field(default_factory=list)
@@ -733,6 +845,10 @@ class Settings:
             self.warp = WarpSettings.from_dict(self.warp)
         if isinstance(self.routing, dict):
             self.routing = RoutingSettings.from_dict(self.routing)
+        if isinstance(self.cdn, dict):
+            self.cdn = CdnSettings.from_dict(self.cdn)
+        if isinstance(self.subscription, dict):
+            self.subscription = SubscriptionSettings.from_dict(self.subscription)
         self.host = normalize_host(self.host)
         target_host, target_port = split_host_port(self.reality_target)
         self.reality_target = format_host_port(target_host, target_port)
@@ -790,6 +906,44 @@ class Settings:
                         "The Argo loopback port must not be inside a port-hopping range",
                         "Argo 回环端口不能位于端口跳跃范围内",
                     ))
+        if self.cdn.argo.enabled:
+            if not self.argo.enabled:
+                raise ConfigError(tr("Argo CDN settings require Argo to be enabled", "Argo CDN 配置要求启用 Argo"))
+            if self.argo.mode != "token":
+                raise ConfigError(tr(
+                    "Argo CDN requires token mode because quick tunnel hostnames are ephemeral",
+                    "Argo CDN 需要 token 模式，因为临时隧道域名会变化",
+                ))
+            if not self.cdn.argo.host:
+                self.cdn.argo.host = self.argo.hostname
+            if not self.cdn.argo.sni:
+                self.cdn.argo.sni = self.argo.hostname or self.cdn.argo.host
+        self.cdn.vmess.validate("VMess")
+        self.cdn.argo.validate("Argo")
+        if self.cdn.vmess.enabled:
+            if not self.protocols["vmess"].enabled:
+                raise ConfigError(tr("VMess CDN settings require the vmess inbound", "VMess CDN 配置要求启用 vmess 入站"))
+            if self.protocols["vmess"].tls_profile:
+                raise ConfigError(tr(
+                    "VMess CDN requires the origin VMess inbound to be plaintext WebSocket",
+                    "VMess CDN 要求源站 VMess 入站使用明文 WebSocket",
+                ))
+        profiles_by_id = {profile.id: profile for profile in self.certificate_profiles}
+        self.subscription.validate(profiles_by_id)
+        if self.subscription.enabled:
+            enabled_ports = {
+                getattr(self.ports, name)
+                for name, protocol in self.protocols.items()
+                if protocol.enabled
+            }
+            if self.subscription.port in enabled_ports or self.subscription.port in acme_ports:
+                raise ConfigError(tr("The subscription port conflicts with an enabled or ACME port", "订阅端口与已启用端口或 ACME 端口冲突"))
+            if self.argo.enabled and self.subscription.port == self.argo.local_port:
+                raise ConfigError(tr("The subscription port conflicts with the Argo loopback port", "订阅端口与 Argo 回环端口冲突"))
+            for value in self.port_hopping.values():
+                start, end = value.split(":", 1)
+                if int(start) <= self.subscription.port <= int(end):
+                    raise ConfigError(tr("The subscription port must not be inside a port-hopping range", "订阅端口不能位于端口跳跃范围内"))
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -809,6 +963,8 @@ class Settings:
             "argo": self.argo.as_dict(),
             "warp": self.warp.as_dict(),
             "routing": self.routing.as_dict(),
+            "cdn": self.cdn.as_dict(),
+            "subscription": self.subscription.as_dict(),
             "protocols": {name: protocol.as_dict() for name, protocol in self.protocols.items()},
             "certificate_profiles": [profile.as_dict() for profile in self.certificate_profiles],
         }
@@ -840,6 +996,8 @@ class Settings:
             argo=ArgoSettings.from_dict(value.get("argo", {})),
             warp=WarpSettings.from_dict(value.get("warp", {})),
             routing=RoutingSettings.from_dict(value.get("routing", {})),
+            cdn=CdnSettings.from_dict(value.get("cdn", {})),
+            subscription=SubscriptionSettings.from_dict(value.get("subscription", {})),
             schema_version=int(value.get("schema_version", 3)),
             protocols=protocols,
             certificate_profiles=profiles,

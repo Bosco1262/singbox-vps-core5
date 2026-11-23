@@ -193,6 +193,44 @@ WantedBy=timers.target
 """
 
 
+def subscription_unit() -> str:
+    return """[Unit]
+Description=sbox5 local subscription service
+After=network.target
+
+[Service]
+Type=simple
+User=sbox5-sub
+Group=sbox5-sub
+ExecStart=/usr/local/bin/sbox5 subscription-serve --non-interactive
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sbox5-subscription
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
 def firewall_unit() -> str:
     return """[Unit]
 Description=sbox5 owned firewall rules

@@ -167,12 +167,12 @@ def validate_manifest(manifest: dict[str, Any], verified: set[str]) -> None:
         if not re.fullmatch(r"sbox5[a-z0-9_.-]*", str(item.get("name", ""))):
             fail(tr("The snapshot contains a non-project scheduler", "快照包含非项目调度器"))
     for record in manifest.get("users_removed", []):
-        if record.get("name") not in ("sbox5", "sbox5-ddns", "sbox5-argo"):
+        if record.get("name") not in ("sbox5", "sbox5-ddns", "sbox5-argo", "sbox5-sub"):
             fail(tr("The snapshot contains a non-project user", "快照包含非项目用户"))
         if not isinstance(record.get("uid"), int) or not isinstance(record.get("gid"), int) or record["uid"] <= 0 or record["gid"] <= 0:
             fail(tr("The snapshot contains an invalid user ID", "快照包含无效的用户 ID"))
     for username in manifest.get("users_created", []):
-        if username not in ("sbox5", "sbox5-ddns", "sbox5-argo"):
+        if username not in ("sbox5", "sbox5-ddns", "sbox5-argo", "sbox5-sub"):
             fail(tr("The snapshot contains a non-project user", "快照包含非项目用户"))
     for record in manifest.get("sysctls", []):
         if record.get("key") not in ("net.core.default_qdisc", "net.ipv4.tcp_congestion_control"):
