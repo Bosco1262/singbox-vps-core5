@@ -5,7 +5,7 @@
 [![License: GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://www.python.org/)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Debian%2012%2B%20%7C%20Ubuntu%2022.04%2B-orange.svg)]()
-[![Tests: 46 Passed](https://img.shields.io/badge/Tests-46%20Passed-brightgreen.svg)]()
+[![Tests: 61 Passed](https://img.shields.io/badge/Tests-61%20Passed-brightgreen.svg)]()
 
 **singbox-vps-core5** (`sbox5`) 是一个面向 Linux VPS 的生产加固、可审计且支持故障回滚的多协议代理套件。在严苛的安全隔离、非 root systemd 沙盒与不可变供应链锁的保护下，实现五大现代协议（**VLESS-Reality**、**VMess-WS**、**Hysteria2**、**TUIC v5** 与 **AnyTLS**）的原生平滑共存。
 
@@ -76,6 +76,10 @@ sbox5 <subcommand>
   cert add     添加自签、原生 ACME 或导入证书配置
   cert bind    将协议绑定到证书配置（VMess 可用 none 关闭 TLS）
   cert remove  删除未绑定的证书配置并自动快照
+  argo         管理 quick/token 隧道、状态、启停与重置
+  warp         注册、导入、轮换、启停或清除 WARP
+  route        管理域名分流、Socks5 与本地 .srs 规则集
+  core         查看、列出、切换或回滚已锁定 sing-box 版本
   snapshots    列出本地历史快照与提交状态
   rollback     使用快照附带的独立恢复器一键回滚系统
   uninstall    安全卸载（自动拍摄快照，清理规则与文件，保留软件包）
@@ -109,7 +113,9 @@ sbox5 <subcommand>
 | `--cloudflare-zone`            | Cloudflare 主域名 Zone                      | 如 `example.com`                         |
 | `--ddns-record`                | DDNS 解析目标完整记录                       | 如 `vpn.example.com`                     |
 | `--argo` / `--no-argo`         | 是否启用 Cloudflare Tunnel (VMess 备用通道) | 默认禁用                                 |
-| `--argo-hostname`              | Argo 隧道外部域名                           | 如 `tunnel.example.com`                  |
+| `--argo-mode`                  | Argo 隧道模式                               | `quick` 或 `token`                       |
+| `--argo-hostname`              | Argo 隧道外部域名                           | token 模式必填                           |
+| `--argo-local-port`            | Argo 使用的回环 VMess 入口端口              | 默认 `18081`                             |
 | `--bbr` / `--no-bbr`           | 启用系统 BBR 拥塞控制                       | 默认禁用                                 |
 | `--firewall` / `--no-firewall` | 自动配置防火墙放行规则                      | 默认启用                                 |
 | `-l`, `--lang`, `--language`   | 显示语言偏好 (`en`, `zh-CN`)                | 自动检测 / 默认 `en`                     |
@@ -156,23 +162,62 @@ Host System (Debian 12 / Ubuntu 22.04)
  ├── /var/lib/sbox5/
  │    ├── acme/<profile>/           (0700, sing-box 原生 ACME 状态)
  │    ├── certificates.json         (按证书配置保存的状态)
+ │    ├── argo/                     (state.json 与临时隧道日志)
+ │    ├── rulesets/                 (本地 .srs 规则集)
+ │    ├── core.json                 (当前/上一版内核)
  │    ├── snapshots/                (0700, 独立快照存储)
  │    └── exports/                  (0700, 客户端配置文件)
  └── Services:
       ├── sbox5.service             (User=sbox5, hardened systemd sandbox, native ACME)
-      ├── sbox5-argo.service        (User=sbox5-argo, --token-file)
+      ├── sbox5-argo.service        (User=sbox5-argo, quick 或 token 隧道)
       ├── sbox5-ddns.timer          (User=sbox5-ddns, dual-source check)
       └── sbox5-firewall.service    (Minimal rule enforcement, no flush)
 ```
 
 ---
 
-## MVP → Phase 1 迁移说明
+## Argo、WARP、分流与内核
 
-- `settings.json` / `state.json` 会自动从 schema v1 迁移到 v2；原有 v1 快照仍由其自带的 `restore.py` 恢复。
+```bash
+# Argo 临时隧道（URL 从加固服务日志中读取）
+sudo sbox5 argo set --mode quick --yes
+sudo sbox5 argo status
+sudo sbox5 argo reset --yes
+
+# Argo 固定 Token 隧道
+sudo sbox5 argo set --mode token --hostname tunnel.example.com --token-file /root/tunnel.token --yes
+
+# 原生 WARP 注册或手动导入
+sudo sbox5 warp register --yes
+sudo sbox5 warp status
+sudo sbox5 warp import --private-key-file /root/wg.key --peer-public-key <key> \
+  --address 172.16.0.2/32 --address 2606:4700:110::2/128 --reserved 1,2,3 --yes
+
+# 域名/规则集分流到 WARP、本地 IPv4/IPv6 或 Socks5
+sudo sbox5 route add --target warp --suffix .openai.com --yes
+sudo sbox5 route socks5 set --server 127.0.0.1 --port 1080 --username user --yes
+sudo sbox5 route ruleset add --tag geosite-cn --target direct-v4 \
+  --url https://github.com/SagerNet/sing-geosite/releases/download/<tag>/geosite-cn.srs \
+  --sha256 <64位SHA256> --yes
+sudo sbox5 route list
+
+# 锁定内核生命周期
+sudo sbox5 core list
+sudo sbox5 core switch --channel stable --yes
+sudo sbox5 core rollback --yes
+```
+
+WARP 注册使用 Cloudflare 客户端注册端点，失败会显式报错，绝不会回退到硬编码/共享私钥；仍可使用手动导入。WARP 私钥保存在 `secrets/protocols.json`（`0600`），并会注入 `config.json`（`0640 root:sbox5`），因为 sing-box 运行时需要读取。内核只接受已锁定版本；切换测试版前需添加 `locks/versions/<version>.json` 并在 `locks/versions/index.json` 设置 `channels.beta`。
+
+---
+
+## MVP → Phase 2 迁移说明
+
+- `settings.json` / `state.json` 会自动从 schema v1/v2 迁移到 v3；原有 v1/v2 快照仍由其自带的 `restore.py` 恢复。
 - 旧的 certbot ACME 配置会迁移为 sing-box 原生 ACME，默认使用 HTTP-01。旧 `/etc/sbox5/acme` 状态会保留但不再使用；sing-box 会在下次启动时重新签发证书。
 - 原有协议端口与凭据保持不变；TUIC/Hysteria2 跳跃范围会通过新的防火墙 reconcile 路径重新下发。
-- Phase 1 不引入 `warp-plus` / Psiphon；原生 WARP 与可选 Socks5 出站计划在 Phase 2 实现。
+- 原有 Argo 配置会迁移为 token 模式并保留域名。Argo 现在使用回环 VMess 入口（默认 `18081`），因此 VMess TLS 与 Argo 可以共存；请将 Cloudflare ingress 更新为 `http://127.0.0.1:18081`。
+- Phase 2 新增原生 WARP、可选 Socks5、本地 `.srs` 规则集与锁定内核切换；`warp-plus` / Psiphon 仍明确排除。
 
 ---
 

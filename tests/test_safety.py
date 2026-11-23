@@ -327,7 +327,7 @@ class CommandTests(unittest.TestCase):
         unit = singbox_unit(configured)
         self.assertIn("User=sbox5", unit)
         self.assertNotIn("AmbientCapabilities=CAP_NET_BIND_SERVICE", unit)
-        self.assertIn("--token-file /etc/sbox5/secrets/argo.token", argo_unit())
+        self.assertIn("--token-file /etc/sbox5/secrets/argo.token", argo_unit(configured))
 
     def test_native_acme_requires_low_port_capability(self):
         configured = Settings(

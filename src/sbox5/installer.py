@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -11,11 +12,13 @@ import subprocess
 from typing import Any
 
 from . import __version__
+from .argo import argo_host, wait_for_quick_url, write_state as write_argo_state
 from .certificates import acme_profile_state, certificate_metadata, create_self_signed, imported_profile_state
 from .config import (
     ACME_STATE_DIR,
     CERTIFICATE_PATH,
     KEY_PATH,
+    RULESET_DIR,
     build_server_config,
     check_server_config,
     config_bytes,
@@ -23,14 +26,15 @@ from .config import (
     profile_acme_data_directory,
     profile_certificate_path,
     profile_key_path,
+    rule_set_path,
 )
 from .ddns import CloudflareDDNS
-from .download import install_locked_binary
+from .download import download_verified_file, install_locked_binary
 from .errors import ConfigError, ConflictError
 from .export import export_nodes
 from .firewall import apply_firewall, needs_firewall_service
 from .i18n import get_language, tr
-from .models import Secrets, Settings
+from .models import RULESET_ALLOWED_HOSTS, Secrets, Settings
 from .services import (
     argo_unit,
     copy_application,
@@ -46,7 +50,7 @@ from .services import (
 )
 from .snapshot import SNAPSHOT_ROOT, Snapshot, prune_snapshots
 from .system import architecture, check_ports, configure_bbr, ensure_packages, preflight
-from .util import atomic_json, atomic_text, atomic_write, load_json, run
+from .util import atomic_json, atomic_text, atomic_write, load_json, run, sha256_file
 
 CONFIG_DIR = Path("/etc/sbox5")
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
@@ -60,9 +64,14 @@ FIREWALL_STATE_PATH = STATE_DIR / "firewall.json"
 CERTIFICATE_STATE_PATH = STATE_DIR / "certificate.json"
 CERTIFICATES_STATE_PATH = STATE_DIR / "certificates.json"
 DDNS_STATE_PATH = STATE_DIR / "ddns/last.json"
+ARGO_DIR = STATE_DIR / "argo"
+ARGO_STATE_PATH = ARGO_DIR / "state.json"
+ARGO_LOG_PATH = ARGO_DIR / "quick.log"
+CORE_STATE_PATH = STATE_DIR / "core.json"
 EXPORT_DIR = STATE_DIR / "exports"
 SYSCTL_PATH = Path("/etc/sysctl.d/99-sbox5.conf")
 BINARY_DIR = Path("/usr/local/libexec/sbox5/bin")
+CORE_CACHE_DIR = Path("/usr/local/libexec/sbox5/core")
 SINGBOX_BINARY = BINARY_DIR / "sing-box"
 CLOUDFLARED_BINARY = BINARY_DIR / "cloudflared"
 UNIT_DIR = Path("/etc/systemd/system")
@@ -94,7 +103,8 @@ def managed_files(settings: Settings | None = None) -> list[Path]:
     files = {
         SETTINGS_PATH, SECRETS_PATH, SERVER_CONFIG_PATH, ARGO_TOKEN_PATH, DDNS_TOKEN_PATH,
         CERTIFICATE_PATH, KEY_PATH, STATE_PATH, FIREWALL_STATE_PATH, CERTIFICATE_STATE_PATH,
-        CERTIFICATES_STATE_PATH, DDNS_STATE_PATH, SYSCTL_PATH, Path("/usr/local/bin/sbox5"), SINGBOX_BINARY, CLOUDFLARED_BINARY,
+        CERTIFICATES_STATE_PATH, DDNS_STATE_PATH, ARGO_STATE_PATH, ARGO_LOG_PATH, CORE_STATE_PATH,
+        SYSCTL_PATH, Path("/usr/local/bin/sbox5"), SINGBOX_BINARY, CLOUDFLARED_BINARY,
         *(UNIT_DIR / name for name in UNITS),
     }
     if settings is not None:
@@ -113,8 +123,8 @@ def _managed_directories(settings: Settings | None = None) -> list[Path]:
     directories = [
         CONFIG_DIR, CONFIG_DIR / "secrets", CONFIG_DIR / "tls", CONFIG_DIR / "tls" / "default",
         STATE_DIR, SNAPSHOT_ROOT, STATE_DIR / "ddns", STATE_DIR / "exports", ACME_STATE_DIR,
-        ACME_STATE_DIR / "default", Path("/var/lib/sbox5-runtime"),
-        Path("/usr/local/libexec/sbox5"), Path("/usr/local/libexec/sbox5/app"), BINARY_DIR,
+        ACME_STATE_DIR / "default", ARGO_DIR, RULESET_DIR, Path("/var/lib/sbox5-runtime"),
+        Path("/usr/local/libexec/sbox5"), Path("/usr/local/libexec/sbox5/app"), BINARY_DIR, CORE_CACHE_DIR,
     ]
     if settings is not None:
         for profile in settings.certificate_profiles:
@@ -137,6 +147,7 @@ class InstallTransaction:
         ddns_token: str = "",
         argo_token: str = "",
         import_files: dict[str, tuple[Path, Path]] | None = None,
+        rule_set_files: dict[str, Path] | None = None,
     ) -> None:
         self.project_root = project_root.resolve()
         self.settings = settings
@@ -147,6 +158,7 @@ class InstallTransaction:
         self.ddns_token = ddns_token
         self.argo_token = argo_token
         self.import_files = dict(import_files or {})
+        self.rule_set_files = dict(rule_set_files or {})
         self.snapshot: Snapshot | None = None
         self.previous_state: dict[str, Any] = {}
         self.previous_settings: Settings | None = None
@@ -217,11 +229,11 @@ class InstallTransaction:
             self._write(DDNS_TOKEN_PATH, (self.ddns_token + "\n").encode(), 0o600, uid, gid)
         else:
             self._remove(DDNS_TOKEN_PATH)
-        if self.settings.argo.enabled:
+        if self.settings.argo.enabled and self.settings.argo.mode == "token":
             if not self.argo_token and ARGO_TOKEN_PATH.is_file() and not ARGO_TOKEN_PATH.is_symlink():
                 self.argo_token = ARGO_TOKEN_PATH.read_text(encoding="utf-8").strip()
             if not self.argo_token:
-                raise ConfigError(tr("Enabling Argo requires a Tunnel Token", "启用 Argo 需要 Tunnel Token"))
+                raise ConfigError(tr("Token mode requires an Argo Tunnel Token", "Token 模式需要 Argo Tunnel Token"))
             uid, gid = identity("sbox5-argo")
             self._write(ARGO_TOKEN_PATH, (self.argo_token + "\n").encode(), 0o600, uid, gid)
         else:
@@ -231,6 +243,46 @@ class InstallTransaction:
         gid = identity("sbox5-ddns")[1] if self.settings.ddns.enabled else 0
         self._json(SETTINGS_PATH, self.settings.as_dict(), 0o640 if self.settings.ddns.enabled else 0o600, 0, gid)
         self._json(SECRETS_PATH, self.secrets.as_dict(), 0o600)
+
+    def _ensure_rulesets(self, uid: int, gid: int) -> None:
+        assert self.snapshot is not None
+        desired = {item.tag: item for item in self.settings.routing.rule_sets}
+        desired_filenames = {item.filename for item in desired.values()}
+        if self.previous_settings is not None:
+            for previous in self.previous_settings.routing.rule_sets:
+                if previous.filename not in desired_filenames:
+                    self._remove(rule_set_path(previous))
+        for tag, item in desired.items():
+            destination = rule_set_path(item)
+            if destination.exists() and not destination.is_symlink() and sha256_file(destination) == item.sha256:
+                continue
+            data: bytes | None = None
+            if tag in self.rule_set_files:
+                source = self.rule_set_files[tag]
+                if source.is_symlink() or not source.is_file():
+                    raise ConfigError(tr(f"Rule-set source must be a regular file: {source}", f"规则集源必须是普通文件：{source}"))
+                if source.stat().st_size > 64 * 1024 * 1024:
+                    raise ConfigError(tr("The rule-set source is too large", "规则集源文件过大"))
+                data = source.read_bytes()
+            elif item.source_url:
+                staging = STATE_DIR / "staging" / f"ruleset-{item.filename}"
+                staging.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                download_verified_file(
+                    item.source_url, item.sha256, staging, RULESET_ALLOWED_HOSTS,
+                    max_size=64 * 1024 * 1024, mode=0o600,
+                )
+                data = staging.read_bytes()
+                staging.unlink()
+            elif destination.is_file() and not destination.is_symlink():
+                data = destination.read_bytes()
+            else:
+                raise ConfigError(tr(
+                    f"Rule-set {item.tag} is missing and has no source URL; add it with 'sbox5 route ruleset add'",
+                    f"规则集 {item.tag} 缺失且没有源 URL；请使用 sbox5 route ruleset add 添加",
+                ))
+            if hashlib.sha256(data).hexdigest() != item.sha256:
+                raise ConfigError(tr(f"Rule-set SHA256 mismatch: {item.tag}", f"规则集 SHA256 不符：{item.tag}"))
+            self._write(destination, data, 0o640, uid, gid)
 
     def _configure_sysctl(self) -> None:
         assert self.snapshot is not None
@@ -262,7 +314,7 @@ class InstallTransaction:
     def _install_units(self) -> None:
         desired: dict[str, str] = {"sbox5.service": singbox_unit(self.settings)}
         if self.settings.argo.enabled:
-            desired["sbox5-argo.service"] = argo_unit()
+            desired["sbox5-argo.service"] = argo_unit(self.settings)
         if self.settings.ddns.enabled:
             desired["sbox5-ddns.service"] = ddns_unit()
             desired["sbox5-ddns.timer"] = ddns_timer(self.settings.ddns.interval_seconds)
@@ -295,6 +347,8 @@ class InstallTransaction:
 
     def run(self) -> dict[str, Any]:
         preflight()
+        warnings: list[str] = []
+        argo_state: dict[str, Any] = {}
         fresh_markers = (
             CONFIG_DIR, Path("/usr/local/libexec/sbox5"), STATE_DIR,
             Path("/usr/local/bin/sbox5"), SYSCTL_PATH, *(UNIT_DIR / name for name in UNITS),
@@ -314,8 +368,6 @@ class InstallTransaction:
         try:
             if self.settings.ddns.enabled:
                 self.snapshot.manifest["external_resources"].append({"type": "cloudflare-dns", "name": self.settings.ddns.record})
-            if self.settings.argo.enabled:
-                self.snapshot.manifest["external_resources"].append({"type": "cloudflare-argo", "name": self.settings.argo.hostname})
             if any(profile.mode == "acme" for profile in self.settings.active_certificate_profiles()):
                 self.snapshot.manifest["external_resources"].append({"type": "acme-local-state", "name": tr("/var/lib/sbox5/acme (preserved on rollback)", "/var/lib/sbox5/acme（回滚保留）")})
             self._stop_existing_services()
@@ -332,6 +384,14 @@ class InstallTransaction:
             singbox_uid, singbox_gid = identity("sbox5")
             self._mkdir(CONFIG_DIR / "tls", 0o750, singbox_uid, singbox_gid)
             self._mkdir(ACME_STATE_DIR, 0o700, singbox_uid, singbox_gid)
+            self._mkdir(RULESET_DIR, 0o750, singbox_uid, singbox_gid)
+            if self.settings.argo.enabled:
+                argo_uid, argo_gid = identity("sbox5-argo")
+                self._mkdir(ARGO_DIR, 0o700, argo_uid, argo_gid)
+                if self.settings.argo.mode == "quick":
+                    self._write(ARGO_LOG_PATH, b"", 0o600, argo_uid, argo_gid)
+                else:
+                    self._remove(ARGO_LOG_PATH)
             self._mkdir(STATE_DIR, 0o711)
             self._mkdir(SNAPSHOT_ROOT, 0o700)
             self._mkdir(EXPORT_DIR, 0o700)
@@ -447,11 +507,13 @@ class InstallTransaction:
             default_metadata = certificate_states.get("default", {})
             self._json(CERTIFICATES_STATE_PATH, certificate_states, 0o600)
             self._json(CERTIFICATE_STATE_PATH, default_metadata, 0o600)
+            self._ensure_rulesets(singbox_uid, singbox_gid)
             self._write(SERVER_CONFIG_PATH, config_bytes(build_server_config(self.settings, self.secrets)), 0o640, singbox_uid, singbox_gid)
             check_server_config(SINGBOX_BINARY, SERVER_CONFIG_PATH)
+            initial_argo_host = self.settings.argo.hostname if self.settings.argo.mode == "token" else ""
             exported = export_nodes(
                 self.settings, self.secrets, CERTIFICATE_PATH, default_metadata, EXPORT_DIR,
-                certificates=certificate_states,
+                certificates=certificate_states, argo_host=initial_argo_host,
             )
             for path in EXPORT_DIR.iterdir():
                 if path.is_file():
@@ -467,6 +529,36 @@ class InstallTransaction:
             if self.settings.argo.enabled:
                 enable_start("sbox5-argo.service")
                 require_active("sbox5-argo.service")
+                quick_url = ""
+                if self.settings.argo.mode == "quick":
+                    quick_url = wait_for_quick_url(ARGO_LOG_PATH, timeout=20)
+                    if not quick_url:
+                        warnings.append(tr(
+                            "The Argo quick tunnel is active but its URL was not found in the log yet; run 'sbox5 argo status' or 'sbox5 export' later.",
+                            "Argo 临时隧道已启动，但日志中尚未出现 URL；请稍后运行 sbox5 argo status 或 sbox5 export。",
+                        ))
+                    self._record(ARGO_LOG_PATH)
+                else:
+                    self._remove(ARGO_LOG_PATH)
+                argo_state = write_argo_state(ARGO_STATE_PATH, self.settings, quick_url)
+                self._record(ARGO_STATE_PATH)
+                resolved_argo_host = argo_host(self.settings, argo_state)
+                self.snapshot.manifest["external_resources"].append({
+                    "type": "cloudflare-quick-tunnel" if self.settings.argo.mode == "quick" else "cloudflare-argo",
+                    "name": quick_url or self.settings.argo.hostname or "pending",
+                })
+                if self.settings.argo.mode == "quick" and resolved_argo_host:
+                    exported = export_nodes(
+                        self.settings, self.secrets, CERTIFICATE_PATH, default_metadata, EXPORT_DIR,
+                        certificates=certificate_states, argo_host=resolved_argo_host,
+                    )
+                    for path in EXPORT_DIR.iterdir():
+                        if path.is_file():
+                            self._record(path)
+                    check_server_config(SINGBOX_BINARY, EXPORT_DIR / "sing-box-client.json")
+            else:
+                self._remove(ARGO_STATE_PATH)
+                self._remove(ARGO_LOG_PATH)
             if self.settings.ddns.enabled:
                 run(["systemctl", "start", "sbox5-ddns.service"], timeout=180)
                 self._record(DDNS_STATE_PATH)
@@ -478,7 +570,7 @@ class InstallTransaction:
                 if path.exists() or entry.get("after") is not None:
                     self._record(path)
             state = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "project_version": __version__,
                 "installed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "components": self.components,
@@ -487,6 +579,10 @@ class InstallTransaction:
                 "protocols": {name: protocol.as_dict() for name, protocol in self.settings.protocols.items()},
                 "certificate_profiles": [profile.as_dict() for profile in self.settings.certificate_profiles],
                 "certificates": certificate_states,
+                "argo": argo_state,
+                "warp": self.settings.warp.as_dict(),
+                "warp_credential": self.secrets.warp.public_state(),
+                "routing": self.settings.routing.as_dict(),
                 "packages": self.snapshot.manifest["packages"],
                 "managed_files": [entry["path"] for entry in self.snapshot.manifest["files"] if Path(entry["path"]).exists()],
                 "snapshot_id": self.snapshot.manifest["snapshot_id"],
@@ -513,7 +609,7 @@ class InstallTransaction:
                 "snapshot": str(self.snapshot.path),
                 "exports": str(EXPORT_DIR),
                 "files": exported["files"],
-                "warnings": exported["warnings"] + firewall_result["warnings"],
+                "warnings": exported["warnings"] + firewall_result["warnings"] + warnings,
             }
         except Exception as exc:
             if self.committed:
@@ -531,10 +627,12 @@ def reconfigure(
     secrets: Secrets,
     feature: str = "reconfigure",
     import_files: dict[str, tuple[Path, Path]] | None = None,
+    rule_set_files: dict[str, Path] | None = None,
+    argo_token: str = "",
 ) -> dict[str, Any]:
     settings.validate()
     secrets.validate()
     return InstallTransaction(
         project_root, settings, secrets, upgrade=True, reconfigure=True, feature=feature,
-        import_files=import_files,
+        import_files=import_files, rule_set_files=rule_set_files, argo_token=argo_token,
     ).run()

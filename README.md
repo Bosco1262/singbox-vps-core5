@@ -5,7 +5,7 @@
 [![License: GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://www.python.org/)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Debian%2012%2B%20%7C%20Ubuntu%2022.04%2B-orange.svg)]()
-[![Tests: 46 Passed](https://img.shields.io/badge/Tests-46%20Passed-brightgreen.svg)]()
+[![Tests: 61 Passed](https://img.shields.io/badge/Tests-61%20Passed-brightgreen.svg)]()
 
 **singbox-vps-core5** (`sbox5`) is a production-hardened, auditable, and rollback-ready proxy suite for Linux VPS. It enables seamless coexistence of five modern protocols (**VLESS-Reality**, **VMess-WS**, **Hysteria2**, **TUIC v5**, and **AnyTLS**) under strict security isolation, non-root systemd sandboxing, and immutable supply-chain locking.
 
@@ -23,6 +23,9 @@
 - **Dual-Source Cloudflare DDNS**: Cross-confirmed IP detection against multiple independent endpoints; prevents split-brain and stale DNS writes.
 - **Non-Destructive Firewall Management**: Adapts to existing UFW, or builds dedicated `inet sbox5` nftables tables. The iptables fallback uses isolated `SBOX5-INPUT` / `SBOX5-PREROUTING` chains. Never flushes system rules.
 - **Hysteria2 / TUIC UDP Port Hopping**: Declarative UDP ranges are reconciled in dedicated firewall chains/table, with SNAT-style local redirects and precise rollback. TUIC has no standard port-range URI field, so the client must choose a concrete port.
+- **Argo Quick & Token Tunnels**: `cloudflared` quick tunnels and fixed token tunnels are managed as hardened non-root services. A dedicated loopback-only VMess ingress lets Argo coexist with public VMess TLS.
+- **Native WARP & Multi-Target Routing**: WARP credentials are registered through the Cloudflare client endpoint or imported manually (never shared keys). Domain suffixes and local `.srs` rule sets route to WARP, direct IPv4/IPv6, or an optional Socks5 outbound.
+- **Locked Core Lifecycle**: Stable/channel/version switching only accepts immutable lock files, pre-checks the new binary with `sing-box check`, and rolls back automatically on failure.
 - **Zero-Trust TLS**: Self-signed mode automatically inlines certificates into sing-box client configs and binds full SHA256 DER fingerprints in Mihomo (Clash.Meta). No `insecure: true` anywhere.
 
 ---
@@ -75,6 +78,10 @@ sbox5 <subcommand>
   cert add     Add a self-signed, native ACME, or imported certificate profile
   cert bind    Bind a protocol to a certificate profile (or 'none' for VMess)
   cert remove  Remove an unbound certificate profile with snapshot rollback
+  argo         Manage quick/token tunnels, status, start/stop, and reset
+  warp         Register, import, rotate, enable/disable, or clear WARP
+  route        Manage domain routes, Socks5, and local .srs rule sets
+  core         Show, list, switch, or roll back locked sing-box versions
   snapshots    List local transaction snapshots and states
   rollback     One-click system rollback using the snapshot's standalone restorer
   uninstall    Safe uninstall (creates snapshot, cleans rules and files, preserves packages)
@@ -108,7 +115,9 @@ sbox5 <subcommand>
 | `--cloudflare-zone` | Cloudflare apex zone domain | e.g., `example.com` |
 | `--ddns-record` | Complete DDNS target record | e.g., `vpn.example.com` |
 | `--argo` / `--no-argo` | Enable Cloudflare Tunnel (VMess backup) | Default disabled |
-| `--argo-hostname` | Cloudflare Tunnel external domain | e.g., `tunnel.example.com` |
+| `--argo-mode` | Argo tunnel mode | `quick` or `token` |
+| `--argo-hostname` | Cloudflare Tunnel external domain | Required for token mode |
+| `--argo-local-port` | Loopback-only VMess ingress for Argo | Default `18081` |
 | `--bbr` / `--no-bbr` | Enable kernel BBR congestion control | Default disabled |
 | `--firewall` / `--no-firewall` | Automatically manage firewall rules | Default enabled |
 | `-l`, `--lang`, `--language` | Language preference (`en`, `zh-CN`) | Auto-detected / `en` |
@@ -153,23 +162,62 @@ Host System (Debian 12 / Ubuntu 22.04)
  ├── /var/lib/sbox5/
  │    ├── acme/<profile>/           (0700, native sing-box ACME state)
  │    ├── certificates.json         (per-profile certificate state)
+ │    ├── argo/                     (state.json + quick tunnel log)
+ │    ├── rulesets/                 (local .srs rule sets)
+ │    ├── core.json                 (current/previous core versions)
  │    ├── snapshots/                (0700, standalone snapshot storage)
  │    └── exports/                  (0700, client configuration profiles)
  └── Services:
       ├── sbox5.service             (User=sbox5, hardened systemd sandbox, native ACME)
-      ├── sbox5-argo.service        (User=sbox5-argo, --token-file)
+      ├── sbox5-argo.service        (User=sbox5-argo, quick or token tunnel)
       ├── sbox5-ddns.timer          (User=sbox5-ddns, dual-source check)
       └── sbox5-firewall.service    (Minimal rule enforcement, no flush)
 ```
 
 ---
 
-## Migration Notes (MVP → Phase 1)
+## Argo, WARP, Routing & Core
 
-- `settings.json` / `state.json` are migrated from schema v1 to v2 automatically. The original v1 snapshot remains restorable by its own bundled `restore.py`.
+```bash
+# Argo quick tunnel (URL is read from the hardened service log)
+sudo sbox5 argo set --mode quick --yes
+sudo sbox5 argo status
+sudo sbox5 argo reset --yes
+
+# Argo fixed token tunnel
+sudo sbox5 argo set --mode token --hostname tunnel.example.com --token-file /root/tunnel.token --yes
+
+# Native WARP registration or manual import
+sudo sbox5 warp register --yes
+sudo sbox5 warp status
+sudo sbox5 warp import --private-key-file /root/wg.key --peer-public-key <key> \
+  --address 172.16.0.2/32 --address 2606:4700:110::2/128 --reserved 1,2,3 --yes
+
+# Domain/rule-set routing to WARP, local IPv4/IPv6, or Socks5
+sudo sbox5 route add --target warp --suffix .openai.com --yes
+sudo sbox5 route socks5 set --server 127.0.0.1 --port 1080 --username user --yes
+sudo sbox5 route ruleset add --tag geosite-cn --target direct-v4 \
+  --url https://github.com/SagerNet/sing-geosite/releases/download/<tag>/geosite-cn.srs \
+  --sha256 <64-hex-sha256> --yes
+sudo sbox5 route list
+
+# Locked core lifecycle
+sudo sbox5 core list
+sudo sbox5 core switch --channel stable --yes
+sudo sbox5 core rollback --yes
+```
+
+WARP registration uses Cloudflare's client registration endpoint and is intentionally never replaced by hard-coded/shared private keys. If registration fails, the error is explicit; manual import remains available. WARP private keys stay in `secrets/protocols.json` (`0600`) and are injected into `config.json` (`0640 root:sbox5`) because sing-box needs them at runtime. Only locked sing-box versions are accepted; add a `locks/versions/<version>.json` file and set `channels.beta` in `locks/versions/index.json` before switching to a beta build.
+
+---
+
+## Migration Notes (MVP → Phase 2)
+
+- `settings.json` / `state.json` are migrated from schema v1/v2 to v3 automatically. Original v1/v2 snapshots remain restorable by their own bundled `restore.py`.
 - Legacy certbot ACME profiles become native sing-box ACME profiles using HTTP-01 by default. The old certbot state under `/etc/sbox5/acme` is preserved but no longer used; the certificate is re-issued by sing-box on the next start.
-- Existing protocol ports and credentials are preserved. TUIC/Hysteria2 hopping ranges are reapplied through the new firewall reconciliation path.
-- `warp-plus` / Psiphon are intentionally not carried into Phase 1; native WARP and optional Socks5 outbounds are planned for Phase 2.
+- Existing protocol ports and credentials are preserved. TUIC/Hysteria2 hopping ranges are reapplied through the firewall reconciliation path.
+- Existing Argo settings are migrated to token mode with the existing hostname. Argo now uses a loopback-only VMess ingress (`18081` by default), so VMess TLS and Argo can coexist; update the Cloudflare ingress to `http://127.0.0.1:18081`.
+- Phase 2 adds native WARP, optional Socks5, local `.srs` rule sets, and locked core switching. `warp-plus` / Psiphon remain intentionally excluded.
 
 ---
 

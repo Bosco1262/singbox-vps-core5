@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "channels": {
+    "stable": "1.14.4",
+    "beta": ""
+  },
+  "note": "Only versions with an immutable lock file (locks/sing-box.json or locks/versions/*.json) are allowed. Add a lock file before enabling beta or a new version."
+}

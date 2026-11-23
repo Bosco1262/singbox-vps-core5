@@ -142,19 +142,27 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn("vmess", {item["type"] for item in document["inbounds"]})
         self.assertNotIn("vmess", build_share_links(configured, secrets(), certificate(), {"default": certificate()}))
 
-    def test_vmess_tls_conflicts_with_argo(self):
-        with self.assertRaises(ConfigError):
-            settings(
-                argo=ArgoSettings(enabled=True, hostname="argo.example.com"),
-                protocols={
-                    "vless": ProtocolSettings(True, ""),
-                    "vmess": ProtocolSettings(True, "default"),
-                },
-            )
+    def test_vmess_tls_can_coexist_with_argo_via_loopback(self):
+        configured = settings(
+            argo=ArgoSettings(enabled=True, mode="token", hostname="argo.example.com"),
+            protocols={
+                "vless": ProtocolSettings(True, ""),
+                "vmess": ProtocolSettings(True, "default"),
+                "hysteria2": ProtocolSettings(True, "default"),
+                "tuic": ProtocolSettings(True, "default"),
+                "anytls": ProtocolSettings(True, "default"),
+            },
+        )
+        document = build_server_config(configured, secrets())
+        inbounds = {item["tag"]: item for item in document["inbounds"]}
+        self.assertIn("tls", inbounds["vmess-ws"])
+        self.assertEqual(inbounds["vmess-argo-origin"]["listen"], "127.0.0.1")
+        self.assertEqual(inbounds["vmess-argo-origin"]["listen_port"], 18081)
+        self.assertNotIn("tls", inbounds["vmess-argo-origin"])
 
-    def test_v1_settings_migrate_to_v2(self):
+    def test_v1_settings_migrate_to_v3(self):
         configured = settings()
-        self.assertEqual(configured.schema_version, 2)
+        self.assertEqual(configured.schema_version, 3)
         self.assertEqual([profile.id for profile in configured.certificate_profiles], ["default"])
         self.assertEqual(configured.protocols["vmess"].tls_profile, "")
         restored = Settings.from_dict(configured.as_dict())

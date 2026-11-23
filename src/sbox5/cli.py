@@ -12,6 +12,7 @@ import subprocess
 import sys
 
 from . import __version__
+from .argo import argo_host, quick_url_from_log, read_state as read_argo_state, wait_for_quick_url, write_state as write_argo_state
 from .config import CERTIFICATE_PATH, check_server_config
 from .ddns import CloudflareDDNS
 from .errors import ConfigError, SBox5Error
@@ -19,6 +20,8 @@ from .export import build_share_links, export_nodes
 from .firewall import apply_firewall
 from .i18n import get_language, normalize_language, resolve_language, set_language, tr
 from .installer import (
+    ARGO_LOG_PATH,
+    ARGO_STATE_PATH,
     ARGO_TOKEN_PATH,
     CERTIFICATE_STATE_PATH,
     CERTIFICATES_STATE_PATH,
@@ -33,11 +36,30 @@ from .installer import (
     load_settings,
     reconfigure,
 )
-from .models import ArgoSettings, CertificateProfile, DDNSSettings, PROTOCOLS, Ports, ProtocolSettings, Secrets, Settings
+from .kernel import catalog as core_catalog
+from .kernel import rollback as core_rollback
+from .kernel import status as core_status
+from .kernel import switch as core_switch
+from .models import (
+    ArgoSettings,
+    CertificateProfile,
+    DDNSSettings,
+    DomainRoute,
+    PROTOCOLS,
+    Ports,
+    ProtocolSettings,
+    ROUTE_TARGETS,
+    RuleSetSettings,
+    Secrets,
+    Settings,
+    Socks5Settings,
+    WarpCredential,
+)
 from .services import require_active
 from .snapshot import SNAPSHOT_ROOT
 from .system import read_token_file, validate_token_text
 from .util import available, load_json, require_linux_root, run, split_host_port
+from .warp import import_warp_credential, register_warp
 
 
 def _interactive(args: argparse.Namespace) -> bool:
@@ -58,6 +80,15 @@ def _confirm(args: argparse.Namespace, text: str) -> None:
         return
     if input(f"{text} [y/N] ").strip().lower() not in ("y", "yes"):
         raise ConfigError(tr("User cancelled the operation", "用户取消操作"))
+
+
+def _current_argo_host(settings: Settings) -> str:
+    state = read_argo_state(ARGO_STATE_PATH)
+    if settings.argo.enabled and settings.argo.mode == "quick":
+        url = quick_url_from_log(ARGO_LOG_PATH) or state.get("quick_url", "")
+        if url:
+            state["quick_url"] = url
+    return argo_host(settings, state)
 
 
 def _add_install_arguments(parser: argparse.ArgumentParser) -> None:
@@ -87,7 +118,9 @@ def _add_install_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--ddns-interval", type=int)
     parser.add_argument("--ddns-token-file", type=Path)
     parser.add_argument("--argo", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--argo-mode", choices=("quick", "token"))
     parser.add_argument("--argo-hostname")
+    parser.add_argument("--argo-local-port", type=int)
     parser.add_argument("--argo-token-file", type=Path)
     parser.add_argument("--non-interactive", action="store_true")
     parser.add_argument("--yes", action="store_true")
@@ -209,19 +242,21 @@ def _request(args: argparse.Namespace, upgrade: bool) -> tuple[Settings, Secrets
         ),
         argo=ArgoSettings(
             enabled=argo_enabled,
+            mode=args.argo_mode or (previous.argo.mode if previous else "token"),
             hostname=args.argo_hostname or (previous.argo.hostname if previous else ""),
+            local_port=args.argo_local_port or (previous.argo.local_port if previous else 18081),
         ),
         protocols=protocols,
         certificate_profiles=profiles,
     )
-    if argo_enabled:
+    if argo_enabled and settings.argo.mode == "token":
         settings.argo.hostname = _prompt(settings.argo.hostname, tr("Argo public hostname", "Argo 公网域名"), args)
     settings.validate()
     ddns_token = read_token_file(args.ddns_token_file, "Cloudflare Token") if args.ddns_token_file else ""
     argo_token = read_token_file(args.argo_token_file, "Argo Token") if args.argo_token_file else ""
     if ddns_enabled and not ddns_token and not DDNS_TOKEN_PATH.is_file():
         ddns_token = _prompt("", tr("Cloudflare API Token (input hidden)", "Cloudflare API Token（输入不可见）"), args, secret=True)
-    if argo_enabled and not argo_token and not ARGO_TOKEN_PATH.is_file():
+    if argo_enabled and settings.argo.mode == "token" and not argo_token and not ARGO_TOKEN_PATH.is_file():
         argo_token = _prompt("", tr("Argo Tunnel Token (input hidden)", "Argo Tunnel Token（输入不可见）"), args, secret=True)
     if ddns_token:
         ddns_token = validate_token_text(ddns_token, "Cloudflare Token")
@@ -249,7 +284,11 @@ def _install(args: argparse.Namespace, upgrade: bool) -> int:
     print(f" - {tr('Ports', '端口')}: {json.dumps(settings.ports.as_dict(), sort_keys=True)}")
     print(f" - {tr('Certificate', '证书')}: {settings.certificate_mode} / {settings.tls_server_name}")
     ddns_state = tr("enabled ", "启用 ") + settings.ddns.record if settings.ddns.enabled else tr("disabled", "禁用")
-    argo_state = tr("enabled ", "启用 ") + settings.argo.hostname if settings.argo.enabled else tr("disabled", "禁用")
+    argo_state = (
+        tr("enabled ", "启用 ") + settings.argo.mode
+        + (f" / {settings.argo.hostname}" if settings.argo.hostname else "")
+        if settings.argo.enabled else tr("disabled", "禁用")
+    )
     print(f" - DDNS: {ddns_state}")
     print(f" - Argo: {argo_state}")
     print(f" - {tr('Firewall auto-management', '防火墙自动管理')}: {settings.manage_firewall}; BBR: {settings.bbr}")
@@ -274,6 +313,13 @@ def _install(args: argparse.Namespace, upgrade: bool) -> int:
 def _status() -> int:
     require_linux_root()
     state = load_json(STATE_PATH)
+    settings = load_settings()
+    secrets = load_secrets()
+    argo_state = read_argo_state(ARGO_STATE_PATH)
+    if settings.argo.enabled and settings.argo.mode == "quick":
+        url = quick_url_from_log(ARGO_LOG_PATH) or argo_state.get("quick_url", "")
+        if url:
+            argo_state["quick_url"] = url
     print(json.dumps({
         "schema_version": state.get("schema_version"),
         "project_version": state.get("project_version"),
@@ -282,6 +328,10 @@ def _status() -> int:
         "protocols": state.get("protocols"),
         "certificate_profiles": state.get("certificate_profiles"),
         "snapshot_id": state.get("snapshot_id"),
+        "argo": argo_state,
+        "warp": settings.warp.as_dict(),
+        "warp_credential": secrets.warp.public_state(),
+        "routing": settings.routing.as_dict(),
     }, ensure_ascii=False, indent=2, sort_keys=True))
     for name in ("sbox5.service", "sbox5-argo.service", "sbox5-ddns.timer", "sbox5-firewall.service"):
         if (Path("/etc/systemd/system") / name).exists():
@@ -302,7 +352,7 @@ def _show(args: argparse.Namespace) -> int:
     settings, secrets = load_settings(), load_secrets()
     metadata = load_json(CERTIFICATE_STATE_PATH) if CERTIFICATE_STATE_PATH.is_file() else {}
     certificates = load_json(CERTIFICATES_STATE_PATH) if CERTIFICATES_STATE_PATH.is_file() else {"default": metadata}
-    links = build_share_links(settings, secrets, metadata, certificates)
+    links = build_share_links(settings, secrets, metadata, certificates, _current_argo_host(settings))
     if args.protocol:
         if args.protocol not in links:
             raise ConfigError(tr("This node is not enabled", "该节点未启用"))
@@ -331,7 +381,7 @@ def _export() -> int:
     certificates = load_json(CERTIFICATES_STATE_PATH) if CERTIFICATES_STATE_PATH.is_file() else {"default": metadata}
     result = export_nodes(
         settings, secrets, CERTIFICATE_PATH, metadata, EXPORT_DIR,
-        certificates=certificates,
+        certificates=certificates, argo_host=_current_argo_host(settings),
     )
     check_server_config(SINGBOX_BINARY, EXPORT_DIR / "sing-box-client.json")
     print(tr("Exported to ", "已导出到 ") + str(EXPORT_DIR))
@@ -379,11 +429,16 @@ def _apply_reconfigure(
     secrets: Secrets,
     feature: str,
     import_files: dict[str, tuple[Path, Path]] | None = None,
+    rule_set_files: dict[str, Path] | None = None,
+    argo_token: str = "",
 ) -> int:
     settings.validate()
     secrets.validate()
     _confirm(args, tr("Apply this configuration change and restart services?", "应用此配置变更并重启服务吗？"))
-    result = reconfigure(args.project_root, settings, secrets, feature, import_files=import_files)
+    result = reconfigure(
+        args.project_root, settings, secrets, feature,
+        import_files=import_files, rule_set_files=rule_set_files, argo_token=argo_token,
+    )
     print(tr("Configuration transaction committed.", "配置事务已提交。"))
     print(tr("Snapshot: ", "快照：") + result["snapshot"])
     print(tr("Client export directory: ", "客户端导出目录：") + result["exports"])
@@ -420,6 +475,221 @@ def _protocol(args: argparse.Namespace) -> int:
             raise ConfigError(tr("VLESS uses Reality and does not accept a TLS profile", "VLESS 使用 Reality，不接受 TLS 配置"))
         protocol.tls_profile = "" if args.tls_profile.lower() in ("none", "off", "disabled") else args.tls_profile
     return _apply_reconfigure(args, settings, secrets, "protocol")
+
+
+def _argo(args: argparse.Namespace) -> int:
+    require_linux_root()
+    settings, secrets = load_settings(), load_secrets()
+    if args.argo_command == "status":
+        state = read_argo_state(ARGO_STATE_PATH)
+        if settings.argo.enabled and settings.argo.mode == "quick":
+            url = quick_url_from_log(ARGO_LOG_PATH) or state.get("quick_url", "")
+            if url:
+                state["quick_url"] = url
+        unit = Path("/etc/systemd/system/sbox5-argo.service")
+        active = run(["systemctl", "is-active", "sbox5-argo.service"], check=False).stdout.strip() if unit.exists() else "not-installed"
+        data = {"settings": settings.argo.as_dict(), "state": state, "service": active}
+        print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) if args.json else json.dumps(data, ensure_ascii=False, sort_keys=True))
+        return 0
+    if args.argo_command == "set":
+        settings.argo.enabled = True
+        settings.argo.mode = args.mode
+        if args.local_port is not None:
+            settings.argo.local_port = args.local_port
+        if args.mode == "quick":
+            settings.argo.hostname = args.hostname or ""
+            return _apply_reconfigure(args, settings, secrets, "argo")
+        if args.hostname is not None:
+            settings.argo.hostname = args.hostname
+        settings.argo.hostname = _prompt(settings.argo.hostname, tr("Argo public hostname", "Argo 公网域名"), args)
+        token = read_token_file(args.token_file, "Argo Token") if args.token_file else ""
+        if not token and not ARGO_TOKEN_PATH.is_file():
+            token = _prompt("", tr("Argo Tunnel Token (input hidden)", "Argo Tunnel Token（输入不可见）"), args, secret=True)
+        return _apply_reconfigure(
+            args, settings, secrets, "argo",
+            argo_token=validate_token_text(token, "Argo Token") if token else "",
+        )
+    if args.argo_command in ("start", "stop"):
+        if not settings.argo.enabled:
+            raise ConfigError(tr("Argo is not enabled", "Argo 未启用"))
+        run(["systemctl", args.argo_command, "sbox5-argo.service"], timeout=90)
+        if args.argo_command == "start":
+            require_active("sbox5-argo.service")
+        print(tr("Argo service: ", "Argo 服务：") + args.argo_command)
+        return 0
+    if args.argo_command == "reset":
+        if not settings.argo.enabled:
+            raise ConfigError(tr("Argo is not enabled", "Argo 未启用"))
+        if settings.argo.mode == "token":
+            token = read_token_file(args.token_file, "Argo Token") if args.token_file else ""
+            if not token:
+                token = _prompt("", tr("New Argo Tunnel Token (input hidden)", "新的 Argo Tunnel Token（输入不可见）"), args, secret=True)
+            return _apply_reconfigure(args, settings, secrets, "argo", argo_token=validate_token_text(token, "Argo Token"))
+        run(["systemctl", "stop", "sbox5-argo.service"], check=False)
+        for path in (ARGO_LOG_PATH, ARGO_STATE_PATH):
+            if path.is_symlink():
+                raise ConfigError(tr(f"Refusing to remove a symbolic link: {path}", f"拒绝删除符号链接：{path}"))
+            if path.exists():
+                path.unlink()
+        run(["systemctl", "start", "sbox5-argo.service"], check=False)
+        require_active("sbox5-argo.service")
+        url = wait_for_quick_url(ARGO_LOG_PATH, timeout=20)
+        state = write_argo_state(ARGO_STATE_PATH, settings, url)
+        print(json.dumps(state, ensure_ascii=False, sort_keys=True))
+        if not url:
+            print(tr("Warning: the quick tunnel URL is not available yet.", "警告：临时隧道 URL 尚未出现。"), file=sys.stderr)
+        return 0
+    raise ConfigError(tr("Unknown Argo command", "未知 Argo 命令"))
+
+
+def _parse_reserved(value: str) -> list[int]:
+    parts = [item for item in value.replace(",", " ").split() if item]
+    try:
+        values = [int(item) for item in parts]
+    except ValueError as exc:
+        raise ConfigError(tr("Reserved bytes must be three integers", "reserved 必须是三个整数")) from exc
+    if len(values) != 3 or any(not 0 <= item <= 255 for item in values):
+        raise ConfigError(tr("Reserved bytes must be three integers between 0 and 255", "reserved 必须是 0 到 255 之间的三个整数"))
+    return values
+
+
+def _warp(args: argparse.Namespace) -> int:
+    require_linux_root()
+    settings, secrets = load_settings(), load_secrets()
+    if args.warp_command == "status":
+        unit = Path("/etc/systemd/system/sbox5.service")
+        active = run(["systemctl", "is-active", "sbox5.service"], check=False).stdout.strip() if unit.exists() else "not-installed"
+        data = {
+            "settings": settings.warp.as_dict(),
+            "credential": secrets.warp.public_state(),
+            "service": active,
+        }
+        print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) if args.json else json.dumps(data, ensure_ascii=False, sort_keys=True))
+        return 0
+    if args.warp_command in ("register", "rotate"):
+        if not SINGBOX_BINARY.is_file():
+            raise ConfigError(tr("The sing-box binary is not installed", "sing-box 二进制未安装"))
+        secrets.warp = register_warp(SINGBOX_BINARY)
+        settings.warp.enabled = True
+        return _apply_reconfigure(args, settings, secrets, "warp")
+    if args.warp_command == "import":
+        private_key = read_token_file(args.private_key_file, "WARP private key")
+        secrets.warp = import_warp_credential(
+            private_key,
+            args.peer_public_key,
+            list(args.address),
+            _parse_reserved(args.reserved),
+            public_key=args.public_key or "",
+            peer_address=args.peer_address,
+            peer_port=args.peer_port,
+            client_id=args.client_id or "",
+        )
+        settings.warp.enabled = True
+        return _apply_reconfigure(args, settings, secrets, "warp")
+    if args.warp_command in ("enable", "disable"):
+        if args.warp_command == "enable" and not secrets.warp.configured:
+            raise ConfigError(tr("No WARP credential is configured", "未配置 WARP 凭证"))
+        settings.warp.enabled = args.warp_command == "enable"
+        return _apply_reconfigure(args, settings, secrets, "warp")
+    if args.warp_command == "clear":
+        settings.warp.enabled = False
+        secrets.warp = WarpCredential()
+        return _apply_reconfigure(args, settings, secrets, "warp")
+    raise ConfigError(tr("Unknown WARP command", "未知 WARP 命令"))
+
+
+def _route(args: argparse.Namespace) -> int:
+    require_linux_root()
+    settings, secrets = load_settings(), load_secrets()
+    if args.route_command == "list":
+        data = {
+            "routes": settings.routing.as_dict()["routes"],
+            "rule_sets": settings.routing.as_dict()["rule_sets"],
+            "socks5": settings.routing.socks5.as_dict(),
+            "warp": settings.warp.as_dict(),
+            "targets": sorted(settings.route_targets()),
+        }
+        print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) if args.json else json.dumps(data, ensure_ascii=False, sort_keys=True))
+        return 0
+    if args.route_command == "add":
+        route = next((item for item in settings.routing.routes if item.target == args.target), None)
+        if route is None:
+            route = DomainRoute(target=args.target, suffixes=[])
+            settings.routing.routes.append(route)
+        existing = {item.strip().lower().lstrip(".") for item in route.suffixes}
+        for suffix in args.suffix:
+            if suffix.strip().lower().lstrip(".") not in existing:
+                route.suffixes.append(suffix)
+        return _apply_reconfigure(args, settings, secrets, "route")
+    if args.route_command == "remove":
+        route = next((item for item in settings.routing.routes if item.target == args.target), None)
+        if route is None:
+            raise ConfigError(tr(f"No route exists for target {args.target}", f"目标 {args.target} 没有路由"))
+        removals = {item.strip().lower().lstrip(".") for item in args.suffix}
+        route.suffixes = [
+            item for item in route.suffixes
+            if item.strip().lower().lstrip(".") not in removals
+        ]
+        if not route.suffixes:
+            settings.routing.routes.remove(route)
+        return _apply_reconfigure(args, settings, secrets, "route")
+    if args.route_command == "clear":
+        settings.routing.routes = []
+        return _apply_reconfigure(args, settings, secrets, "route")
+    if args.route_command == "socks5":
+        if args.socks5_command == "set":
+            settings.routing.socks5 = Socks5Settings(
+                enabled=True, server=args.server, port=args.port, username=args.username or "",
+            )
+            password = read_token_file(args.password_file, "Socks5 password") if args.password_file else ""
+            if settings.routing.socks5.username and not password:
+                password = _prompt("", tr("Socks5 password (input hidden)", "Socks5 密码（输入不可见）"), args, secret=True)
+            if settings.routing.socks5.username and not password:
+                raise ConfigError(tr("Socks5 username requires a password", "Socks5 用户名需要密码"))
+            secrets.socks5_password = validate_token_text(password, "Socks5 password") if password else ""
+            return _apply_reconfigure(args, settings, secrets, "route")
+        settings.routing.socks5 = Socks5Settings()
+        secrets.socks5_password = ""
+        return _apply_reconfigure(args, settings, secrets, "route")
+    if args.route_command == "ruleset":
+        if args.ruleset_command == "list":
+            print(json.dumps(settings.routing.rule_sets, ensure_ascii=False, indent=2, sort_keys=True, default=lambda item: item.as_dict()) if args.json else json.dumps([item.as_dict() for item in settings.routing.rule_sets], ensure_ascii=False, sort_keys=True))
+            return 0
+        if args.ruleset_command == "add":
+            if any(item.tag == args.tag for item in settings.routing.rule_sets):
+                raise ConfigError(tr(f"Rule-set already exists: {args.tag}", f"规则集已存在：{args.tag}"))
+            item = RuleSetSettings(
+                tag=args.tag,
+                filename=args.filename or f"{args.tag}.srs",
+                sha256=args.sha256,
+                target=args.target,
+                source_url=args.url or "",
+            )
+            item.validate(settings.route_targets())
+            settings.routing.rule_sets.append(item)
+            files = {item.tag: args.file} if args.file else None
+            return _apply_reconfigure(args, settings, secrets, "route", rule_set_files=files)
+        if args.ruleset_command == "remove":
+            item = next((entry for entry in settings.routing.rule_sets if entry.tag == args.tag), None)
+            if item is None:
+                raise ConfigError(tr(f"Rule-set not found: {args.tag}", f"规则集不存在：{args.tag}"))
+            settings.routing.rule_sets.remove(item)
+            return _apply_reconfigure(args, settings, secrets, "route")
+        if args.ruleset_command == "update":
+            item = next((entry for entry in settings.routing.rule_sets if entry.tag == args.tag), None)
+            if item is None:
+                raise ConfigError(tr(f"Rule-set not found: {args.tag}", f"规则集不存在：{args.tag}"))
+            item.sha256 = args.sha256
+            if args.filename:
+                item.filename = args.filename
+            if args.url:
+                item.source_url = args.url
+            elif args.file:
+                item.source_url = ""
+            item.validate(settings.route_targets())
+            files = {item.tag: args.file} if args.file else None
+            return _apply_reconfigure(args, settings, secrets, "route", rule_set_files=files)
+    raise ConfigError(tr("Unknown route command", "未知路由命令"))
 
 
 def _certificate(args: argparse.Namespace) -> int:
@@ -511,6 +781,40 @@ def _certificate(args: argparse.Namespace) -> int:
         return _apply_reconfigure(args, settings, secrets, "certificate")
 
     raise ConfigError(tr("Unknown certificate command", "未知证书命令"))
+
+
+def _core(args: argparse.Namespace) -> int:
+    require_linux_root()
+    if args.core_command == "status":
+        print(json.dumps(core_status(args.project_root), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.core_command == "list":
+        print(json.dumps(core_catalog(args.project_root), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.core_command == "switch":
+        version = args.version
+        if not version:
+            channels = core_catalog(args.project_root)["channels"]
+            version = channels.get(args.channel, "")
+            if not version:
+                raise ConfigError(tr(
+                    f"No locked sing-box version is configured for the {args.channel} channel",
+                    f"{args.channel} 通道没有已锁定的 sing-box 版本",
+                ))
+        settings = load_settings()
+        _confirm(args, tr(f"Switch sing-box to {version} and restart the service?", f"将 sing-box 切换到 {version} 并重启服务吗？"))
+        result = core_switch(args.project_root, settings, version)
+        print(tr("Core switched: ", "内核已切换：") + f"{result['previous'] or '-'} -> {result['current']}")
+        print(tr("Snapshot: ", "快照：") + result["snapshot"])
+        return 0
+    if args.core_command == "rollback":
+        settings = load_settings()
+        _confirm(args, tr("Roll back to the previous sing-box version?", "回滚到上一版 sing-box 吗？"))
+        result = core_rollback(args.project_root, settings)
+        print(tr("Core rolled back: ", "内核已回滚：") + f"{result['previous'] or '-'} -> {result['current']}")
+        print(tr("Snapshot: ", "快照：") + result["snapshot"])
+        return 0
+    raise ConfigError(tr("Unknown core command", "未知内核命令"))
 
 
 def _snapshots() -> int:
@@ -620,6 +924,106 @@ def build_parser() -> argparse.ArgumentParser:
     cert_bind.add_argument("--protocol", choices=PROTOCOLS, required=True)
     cert_bind.add_argument("--profile", required=True, help=tr("Profile ID, or 'none'", "配置 ID，或 none"))
     cert_bind.add_argument("--yes", action="store_true")
+    argo = commands.add_parser("argo", parents=[language], help=tr("Manage the Cloudflare Argo tunnel", "管理 Cloudflare Argo 隧道"))
+    argo_commands = argo.add_subparsers(dest="argo_command", required=True)
+    argo_status = argo_commands.add_parser("status", parents=[language], help=tr("Show Argo status and quick URL", "显示 Argo 状态与临时 URL"))
+    argo_status.add_argument("--json", action="store_true")
+    argo_set = argo_commands.add_parser("set", parents=[language], help=tr("Configure quick or token mode", "配置 quick 或 token 模式"))
+    argo_set.add_argument("--mode", choices=("quick", "token"), required=True)
+    argo_set.add_argument("--hostname")
+    argo_set.add_argument("--local-port", type=int)
+    argo_set.add_argument("--token-file", type=Path)
+    argo_set.add_argument("--yes", action="store_true")
+    argo_start = argo_commands.add_parser("start", parents=[language], help=tr("Start the Argo service", "启动 Argo 服务"))
+    argo_stop = argo_commands.add_parser("stop", parents=[language], help=tr("Stop the Argo service", "停止 Argo 服务"))
+    argo_reset = argo_commands.add_parser("reset", parents=[language], help=tr("Reset quick tunnel or replace a token", "重置临时隧道或更换 Token"))
+    argo_reset.add_argument("--token-file", type=Path)
+    argo_reset.add_argument("--yes", action="store_true")
+    warp = commands.add_parser("warp", parents=[language], help=tr("Manage native Cloudflare WARP credentials", "管理原生 Cloudflare WARP 凭证"))
+    warp_commands = warp.add_subparsers(dest="warp_command", required=True)
+    warp_status = warp_commands.add_parser("status", parents=[language], help=tr("Show WARP status without private keys", "显示 WARP 状态（不含私钥）"))
+    warp_status.add_argument("--json", action="store_true")
+    warp_register = warp_commands.add_parser("register", parents=[language], help=tr("Register a new WARP credential", "注册新的 WARP 凭证"))
+    warp_register.add_argument("--yes", action="store_true")
+    warp_rotate = warp_commands.add_parser("rotate", parents=[language], help=tr("Rotate the WARP credential", "轮换 WARP 凭证"))
+    warp_rotate.add_argument("--yes", action="store_true")
+    warp_import = warp_commands.add_parser("import", parents=[language], help=tr("Import a manual WireGuard WARP credential", "导入手动 WireGuard WARP 凭证"))
+    warp_import.add_argument("--private-key-file", type=Path, required=True)
+    warp_import.add_argument("--peer-public-key", required=True)
+    warp_import.add_argument("--address", action="append", required=True)
+    warp_import.add_argument("--reserved", default="0,0,0")
+    warp_import.add_argument("--public-key")
+    warp_import.add_argument("--peer-address", default="engage.cloudflareclient.com")
+    warp_import.add_argument("--peer-port", type=int, default=2408)
+    warp_import.add_argument("--client-id")
+    warp_import.add_argument("--yes", action="store_true")
+    warp_enable = warp_commands.add_parser("enable", parents=[language], help=tr("Enable a configured WARP credential", "启用已配置的 WARP 凭证"))
+    warp_enable.add_argument("--yes", action="store_true")
+    warp_disable = warp_commands.add_parser("disable", parents=[language], help=tr("Disable WARP without deleting credentials", "禁用 WARP，保留凭证"))
+    warp_disable.add_argument("--yes", action="store_true")
+    warp_clear = warp_commands.add_parser("clear", parents=[language], help=tr("Disable WARP and delete credentials", "禁用 WARP 并删除凭证"))
+    warp_clear.add_argument("--yes", action="store_true")
+    route = commands.add_parser("route", parents=[language], help=tr("Manage domain routing, Socks5, and rule sets", "管理域名分流、Socks5 与规则集"))
+    route_commands = route.add_subparsers(dest="route_command", required=True)
+    route_list = route_commands.add_parser("list", parents=[language], help=tr("Show routing state", "显示分流状态"))
+    route_list.add_argument("--json", action="store_true")
+    route_add = route_commands.add_parser("add", parents=[language], help=tr("Route domain suffixes to a target", "将域名后缀分流到目标"))
+    route_add.add_argument("--target", choices=ROUTE_TARGETS, required=True)
+    route_add.add_argument("--suffix", action="append", required=True)
+    route_add.add_argument("--yes", action="store_true")
+    route_remove = route_commands.add_parser("remove", parents=[language], help=tr("Remove domain suffixes from a route", "从路由中移除域名后缀"))
+    route_remove.add_argument("--target", choices=ROUTE_TARGETS, required=True)
+    route_remove.add_argument("--suffix", action="append", required=True)
+    route_remove.add_argument("--yes", action="store_true")
+    route_clear = route_commands.add_parser("clear", parents=[language], help=tr("Clear all domain routes", "清空所有域名路由"))
+    route_clear.add_argument("--yes", action="store_true")
+    socks5 = route_commands.add_parser("socks5", parents=[language], help=tr("Manage the optional Socks5 outbound", "管理可选 Socks5 出站"))
+    socks5_commands = socks5.add_subparsers(dest="socks5_command", required=True)
+    socks5_set = socks5_commands.add_parser("set", parents=[language], help=tr("Set Socks5 outbound parameters", "设置 Socks5 出站参数"))
+    socks5_set.add_argument("--server", required=True)
+    socks5_set.add_argument("--port", type=int, default=1080)
+    socks5_set.add_argument("--username")
+    socks5_set.add_argument("--password-file", type=Path)
+    socks5_set.add_argument("--yes", action="store_true")
+    socks5_clear = socks5_commands.add_parser("clear", parents=[language], help=tr("Remove the Socks5 outbound", "移除 Socks5 出站"))
+    socks5_clear.add_argument("--yes", action="store_true")
+    ruleset = route_commands.add_parser("ruleset", parents=[language], help=tr("Manage local .srs rule sets", "管理本地 .srs 规则集"))
+    ruleset_commands = ruleset.add_subparsers(dest="ruleset_command", required=True)
+    ruleset_list = ruleset_commands.add_parser("list", parents=[language], help=tr("List rule sets", "列出规则集"))
+    ruleset_list.add_argument("--json", action="store_true")
+    ruleset_add = ruleset_commands.add_parser("add", parents=[language], help=tr("Add a rule set from a local file or URL", "从本地文件或 URL 添加规则集"))
+    ruleset_add.add_argument("--tag", required=True)
+    ruleset_add.add_argument("--target", choices=ROUTE_TARGETS, required=True)
+    ruleset_add.add_argument("--sha256", required=True)
+    ruleset_add.add_argument("--filename")
+    source = ruleset_add.add_mutually_exclusive_group(required=True)
+    source.add_argument("--file", type=Path)
+    source.add_argument("--url")
+    ruleset_add.add_argument("--yes", action="store_true")
+    ruleset_remove = ruleset_commands.add_parser("remove", parents=[language], help=tr("Remove a rule set", "移除规则集"))
+    ruleset_remove.add_argument("--tag", required=True)
+    ruleset_remove.add_argument("--yes", action="store_true")
+    ruleset_update = ruleset_commands.add_parser("update", parents=[language], help=tr("Update a rule set hash or source", "更新规则集哈希或来源"))
+    ruleset_update.add_argument("--tag", required=True)
+    ruleset_update.add_argument("--sha256", required=True)
+    ruleset_update.add_argument("--filename")
+    update_source = ruleset_update.add_mutually_exclusive_group(required=True)
+    update_source.add_argument("--file", type=Path)
+    update_source.add_argument("--url")
+    ruleset_update.add_argument("--yes", action="store_true")
+    core = commands.add_parser("core", parents=[language], help=tr("Manage locked sing-box versions", "管理锁定的 sing-box 版本"))
+    core_commands = core.add_subparsers(dest="core_command", required=True)
+    core_status = core_commands.add_parser("status", parents=[language], help=tr("Show the active core version", "显示当前内核版本"))
+    core_status.add_argument("--json", action="store_true")
+    core_list = core_commands.add_parser("list", parents=[language], help=tr("List locked versions and channels", "列出锁定版本与通道"))
+    core_list.add_argument("--json", action="store_true")
+    core_switch = core_commands.add_parser("switch", parents=[language], help=tr("Switch to a locked core version", "切换到已锁定内核版本"))
+    core_target = core_switch.add_mutually_exclusive_group(required=True)
+    core_target.add_argument("--version")
+    core_target.add_argument("--channel", choices=("stable", "beta"))
+    core_switch.add_argument("--yes", action="store_true")
+    core_rollback = core_commands.add_parser("rollback", parents=[language], help=tr("Roll back to the previous core version", "回滚到上一版内核"))
+    core_rollback.add_argument("--yes", action="store_true")
     commands.add_parser("ddns-update", parents=[language], help=argparse.SUPPRESS).add_argument("--non-interactive", action="store_true")
     commands.add_parser("firewall-apply", parents=[language], help=argparse.SUPPRESS).add_argument("--non-interactive", action="store_true")
     commands.add_parser("snapshots", parents=[language], help=tr("List transaction snapshots", "列出事务快照"))
@@ -662,6 +1066,14 @@ def main(argv: list[str] | None = None) -> int:
             return _protocol(args)
         if args.command == "cert":
             return _certificate(args)
+        if args.command == "argo":
+            return _argo(args)
+        if args.command == "warp":
+            return _warp(args)
+        if args.command == "route":
+            return _route(args)
+        if args.command == "core":
+            return _core(args)
         if args.command == "ddns-update":
             return _ddns_update()
         if args.command == "firewall-apply":

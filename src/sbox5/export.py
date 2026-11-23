@@ -48,10 +48,12 @@ def build_client_outbounds(
     secrets: Secrets,
     certificate_pem: str,
     certificate_pems: dict[str, str] | None = None,
+    argo_host: str = "",
 ) -> list[dict[str, Any]]:
     host = settings.host
     certificate_pems = certificate_pems or {}
     inbounds: list[dict[str, Any]] = []
+    resolved_argo_host = argo_host or settings.argo.hostname
     if settings.protocols["vless"].enabled:
         inbounds.append({
             "type": "vless",
@@ -83,17 +85,17 @@ def build_client_outbounds(
             pem = certificate_pems.get(profile.id, certificate_pem if profile.id == "default" else "")
             vmess["tls"] = _client_tls(profile, pem, ["h2", "http/1.1"])
         inbounds.append(vmess)
-        if settings.argo.enabled:
+        if settings.argo.enabled and resolved_argo_host:
             inbounds.append({
                 "type": "vmess",
                 "tag": "vmess-argo",
-                "server": settings.argo.hostname,
+                "server": resolved_argo_host,
                 "server_port": 443,
                 "uuid": secrets.vmess_uuid,
                 "security": "auto",
                 "alter_id": 0,
-                "tls": {"enabled": True, "server_name": settings.argo.hostname},
-                "transport": {"type": "ws", "path": secrets.vmess_path, "headers": {"Host": settings.argo.hostname}, "max_early_data": 0},
+                "tls": {"enabled": True, "server_name": resolved_argo_host},
+                "transport": {"type": "ws", "path": secrets.vmess_path, "headers": {"Host": resolved_argo_host}, "max_early_data": 0},
             })
     if settings.protocols["hysteria2"].enabled:
         profile = _profile_for(settings, "hysteria2")
@@ -151,8 +153,9 @@ def build_singbox_client(
     secrets: Secrets,
     certificate_pem: str,
     certificate_pems: dict[str, str] | None = None,
+    argo_host: str = "",
 ) -> dict[str, Any]:
-    outbounds = build_client_outbounds(settings, secrets, certificate_pem, certificate_pems)
+    outbounds = build_client_outbounds(settings, secrets, certificate_pem, certificate_pems, argo_host)
     final = outbounds[0]["tag"] if outbounds else "direct"
     return {
         "log": {"level": "info", "timestamp": True},
@@ -180,8 +183,10 @@ def build_share_links(
     secrets: Secrets,
     certificate: dict[str, Any],
     certificates: dict[str, dict[str, Any]] | None = None,
+    argo_host: str = "",
 ) -> dict[str, str]:
     host = settings.host
+    resolved_argo_host = argo_host or settings.argo.hostname
     links: dict[str, str] = {}
     if settings.protocols["vless"].enabled:
         links["vless"] = _url("vless", secrets.vless_uuid, host, settings.ports.vless, {
@@ -200,10 +205,10 @@ def build_share_links(
             vmess["sni"] = profile.server_name
             vmess["host"] = profile.server_name
         links["vmess"] = "vmess://" + base64.b64encode(json.dumps(vmess, ensure_ascii=False, separators=(",", ":")).encode()).decode()
-        if settings.argo.enabled:
+        if settings.argo.enabled and resolved_argo_host:
             argo_vmess = {
-                **vmess, "ps": "sbox5-vmess-argo", "add": settings.argo.hostname, "port": "443",
-                "host": settings.argo.hostname, "sni": settings.argo.hostname, "tls": "tls",
+                **vmess, "ps": "sbox5-vmess-argo", "add": resolved_argo_host, "port": "443",
+                "host": resolved_argo_host, "sni": resolved_argo_host, "tls": "tls",
             }
             links["vmess-argo"] = "vmess://" + base64.b64encode(json.dumps(argo_vmess, ensure_ascii=False, separators=(",", ":")).encode()).decode()
     if settings.protocols["hysteria2"].enabled:
@@ -256,8 +261,10 @@ def build_mihomo(
     secrets: Secrets,
     certificate: dict[str, Any],
     certificates: dict[str, dict[str, Any]] | None = None,
+    argo_host: str = "",
 ) -> dict[str, Any]:
     host = settings.host
+    resolved_argo_host = argo_host or settings.argo.hostname
     proxies: list[dict[str, Any]] = []
     if settings.protocols["vless"].enabled:
         proxies.append({
@@ -280,12 +287,12 @@ def build_mihomo(
                 **({"fingerprint": metadata["certificate_fingerprint"]} if profile.mode != "acme" and metadata.get("certificate_fingerprint") else {}),
             })
         proxies.append(vmess)
-        if settings.argo.enabled:
+        if settings.argo.enabled and resolved_argo_host:
             proxies.append({
-                "name": "sbox5-vmess-argo", "type": "vmess", "server": settings.argo.hostname, "port": 443,
+                "name": "sbox5-vmess-argo", "type": "vmess", "server": resolved_argo_host, "port": 443,
                 "uuid": secrets.vmess_uuid, "alterId": 0, "cipher": "auto", "network": "ws", "udp": True,
-                "tls": True, "servername": settings.argo.hostname, "skip-cert-verify": False,
-                "ws-opts": {"path": secrets.vmess_path, "headers": {"Host": settings.argo.hostname}},
+                "tls": True, "servername": resolved_argo_host, "skip-cert-verify": False,
+                "ws-opts": {"path": secrets.vmess_path, "headers": {"Host": resolved_argo_host}},
             })
     if settings.protocols["hysteria2"].enabled:
         profile = _profile_for(settings, "hysteria2")
@@ -357,6 +364,7 @@ def export_nodes(
     certificate: dict[str, Any],
     destination: Path,
     certificates: dict[str, dict[str, Any]] | None = None,
+    argo_host: str = "",
 ) -> dict[str, Any]:
     destination.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(destination, 0o700)
@@ -385,7 +393,8 @@ def export_nodes(
                 f"证书配置 {profile.id} 的证书文件缺失",
             ))
     default_pem = certificate_pems.get("default", "")
-    links = build_share_links(settings, secrets, certificate, certificates)
+    resolved_argo_host = argo_host or settings.argo.hostname
+    links = build_share_links(settings, secrets, certificate, certificates, resolved_argo_host)
     qr_files: list[str] = []
     if available("qrencode"):
         qr_files = [f"{protocol}.png" for protocol in links]
@@ -400,10 +409,10 @@ def export_nodes(
     atomic_text(destination / "subscription-base64.txt", base64.b64encode(raw_subscription.encode()).decode() + "\n", 0o600)
     atomic_json(
         destination / "sing-box-client.json",
-        build_singbox_client(settings, secrets, default_pem, certificate_pems),
+        build_singbox_client(settings, secrets, default_pem, certificate_pems, resolved_argo_host),
         0o600,
     )
-    atomic_text(destination / "mihomo.yaml", yaml_dump(build_mihomo(settings, secrets, certificate, certificates)) + "\n", 0o600)
+    atomic_text(destination / "mihomo.yaml", yaml_dump(build_mihomo(settings, secrets, certificate, certificates, resolved_argo_host)) + "\n", 0o600)
     for profile in settings.active_certificate_profiles():
         if profile.mode == "acme":
             continue
@@ -431,6 +440,12 @@ def export_nodes(
         "certificates": certificates,
     }
     if settings.argo.enabled:
-        metadata["warnings"].append(tr(f"Argo only provides a VMess-WebSocket fallback entry; the Cloudflare ingress must point to http://127.0.0.1:{settings.ports.vmess} and match the selected path.", f"Argo 仅提供 VMess-WebSocket 备用入口；Cloudflare 后台 ingress 必须指向 http://127.0.0.1:{settings.ports.vmess} 并匹配所选路径。"))
+        if not resolved_argo_host:
+            metadata["warnings"].append(tr(
+                "Argo is enabled but its public hostname is not available yet; the Argo node was omitted from exports.",
+                "Argo 已启用但公网域名尚不可用；导出中已省略 Argo 节点。",
+            ))
+        else:
+            metadata["warnings"].append(tr(f"Argo only provides a VMess-WebSocket fallback entry; the Cloudflare ingress must point to http://127.0.0.1:{settings.argo.local_port} and match the selected path.", f"Argo 仅提供 VMess-WebSocket 备用入口；Cloudflare 后台 ingress 必须指向 http://127.0.0.1:{settings.argo.local_port} 并匹配所选路径。"))
     atomic_json(destination / "metadata.json", metadata, 0o600)
     return {"links": links, "files": sorted(path.name for path in destination.iterdir() if path.is_file()), "warnings": metadata["warnings"]}

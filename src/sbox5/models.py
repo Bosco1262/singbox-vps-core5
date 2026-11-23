@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
+import ipaddress
 import re
 import secrets as random_secrets
 from typing import Any
@@ -19,7 +21,13 @@ TLS_REQUIRED_PROTOCOLS = ("hysteria2", "tuic", "anytls")
 UDP_PROTOCOLS = ("hysteria2", "tuic")
 CERTIFICATE_MODES = ("self-signed", "acme", "imported")
 ACME_CHALLENGES = ("http-01", "dns-01", "tls-alpn-01")
-_PROFILE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+PROFILE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+TAG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+RULESET_FILENAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}\.srs$")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+ROUTE_TARGETS = ("direct", "direct-v4", "direct-v6", "warp", "socks5")
+RULESET_ALLOWED_HOSTS = {"github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"}
+_PROFILE_ID = PROFILE_ID
 
 
 def _validate_email(value: str) -> str:
@@ -209,21 +217,344 @@ class DDNSSettings:
         return result
 
 
+def _validate_domain_suffix(value: str) -> str:
+    original = value.strip().lower()
+    if not original or original == "." or "/" in original or " " in original:
+        raise ConfigError(tr(f"Invalid domain suffix: {value}", f"域名后缀无效：{value}"))
+    if original.startswith("*."):
+        original = original[1:]
+    candidate = original[1:] if original.startswith(".") else original
+    normalize_host(candidate)
+    return original
+
+
+def _validate_source_url(value: str) -> str:
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(value)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.hostname.lower() not in RULESET_ALLOWED_HOSTS:
+        raise ConfigError(tr(
+            f"Rule-set URLs must use HTTPS and an official GitHub release host: {value}",
+            f"规则集 URL 必须使用 HTTPS 和官方 GitHub Release 主机：{value}",
+        ))
+    if parsed.username or parsed.password or parsed.port not in (None, 443):
+        raise ConfigError(tr("The rule-set URL contains disallowed credentials or a port", "规则集 URL 包含不允许的凭证或端口"))
+    return value
+
+
+def _validate_wireguard_key(value: str, label: str) -> str:
+    value = value.strip()
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except Exception as exc:
+        raise ConfigError(tr(f"Invalid WireGuard {label}", f"WireGuard {label} 无效")) from exc
+    if len(decoded) != 32:
+        raise ConfigError(tr(f"Invalid WireGuard {label} length", f"WireGuard {label} 长度无效"))
+    return value
+
+
+@dataclass
+class WarpCredential:
+    private_key: str = ""
+    public_key: str = ""
+    peer_public_key: str = ""
+    addresses: list[str] = field(default_factory=list)
+    reserved: list[int] = field(default_factory=lambda: [0, 0, 0])
+    peer_address: str = "engage.cloudflareclient.com"
+    peer_port: int = 2408
+    client_id: str = ""
+    registered_at: str = ""
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.private_key and self.peer_public_key and self.addresses)
+
+    def validate(self) -> None:
+        if not any((self.private_key, self.public_key, self.peer_public_key, self.addresses)):
+            return
+        self.private_key = _validate_wireguard_key(self.private_key, tr("private key", "私钥"))
+        if self.public_key:
+            self.public_key = _validate_wireguard_key(self.public_key, tr("public key", "公钥"))
+        self.peer_public_key = _validate_wireguard_key(self.peer_public_key, tr("peer public key", "对端公钥"))
+        if not self.addresses or len(self.addresses) > 4:
+            raise ConfigError(tr("WARP requires one or two local addresses", "WARP 需要一到两个本地地址"))
+        normalized: list[str] = []
+        for address in self.addresses:
+            try:
+                normalized.append(str(ipaddress.ip_interface(address)))
+            except ValueError as exc:
+                raise ConfigError(tr(f"Invalid WARP address: {address}", f"WARP 地址无效：{address}")) from exc
+        self.addresses = normalized
+        if not isinstance(self.reserved, list) or len(self.reserved) != 3 or any(
+            not isinstance(item, int) or isinstance(item, bool) or not 0 <= item <= 255 for item in self.reserved
+        ):
+            raise ConfigError(tr("WARP reserved field must contain exactly three bytes", "WARP reserved 字段必须包含三个字节"))
+        self.peer_address = validate_hostname(self.peer_address or "engage.cloudflareclient.com", tr("WARP peer address", "WARP 对端地址"))
+        self.peer_port = validate_port(self.peer_port)
+        if self.client_id and (len(self.client_id) > 256 or any(char in self.client_id for char in "\r\n\x00")):
+            raise ConfigError(tr("Invalid WARP client ID", "WARP client ID 无效"))
+        if self.registered_at and len(self.registered_at) > 64:
+            raise ConfigError(tr("Invalid WARP registration timestamp", "WARP 注册时间戳无效"))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "private_key": self.private_key,
+            "public_key": self.public_key,
+            "peer_public_key": self.peer_public_key,
+            "addresses": list(self.addresses),
+            "reserved": list(self.reserved),
+            "peer_address": self.peer_address,
+            "peer_port": self.peer_port,
+            "client_id": self.client_id,
+            "registered_at": self.registered_at,
+        }
+
+    def public_state(self) -> dict[str, Any]:
+        return {
+            "configured": self.configured,
+            "public_key": self.public_key,
+            "peer_public_key": self.peer_public_key,
+            "addresses": list(self.addresses),
+            "reserved": list(self.reserved),
+            "peer_address": self.peer_address,
+            "peer_port": self.peer_port,
+            "registered_at": self.registered_at,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "WarpCredential":
+        result = cls(
+            private_key=str(value.get("private_key", "")),
+            public_key=str(value.get("public_key", "")),
+            peer_public_key=str(value.get("peer_public_key", "")),
+            addresses=[str(item) for item in value.get("addresses", [])],
+            reserved=[int(item) for item in value.get("reserved", [0, 0, 0])],
+            peer_address=str(value.get("peer_address", "engage.cloudflareclient.com")),
+            peer_port=int(value.get("peer_port", 2408)),
+            client_id=str(value.get("client_id", "")),
+            registered_at=str(value.get("registered_at", "")),
+        )
+        result.validate()
+        return result
+
+
+@dataclass
+class WarpSettings:
+    enabled: bool = False
+    tag: str = "warp"
+    endpoint: str = ""
+    port: int = 0
+    mtu: int = 1280
+
+    def validate(self) -> None:
+        self.tag = self.tag.strip().lower() or "warp"
+        if not TAG_PATTERN.fullmatch(self.tag):
+            raise ConfigError(tr(f"Invalid WARP tag: {self.tag}", f"WARP 标签无效：{self.tag}"))
+        if self.tag in ("direct", "direct-v4", "direct-v6", "socks5"):
+            raise ConfigError(tr(f"The WARP tag is reserved: {self.tag}", f"WARP 标签为保留名称：{self.tag}"))
+        if self.endpoint:
+            self.endpoint = validate_hostname(self.endpoint, tr("WARP endpoint", "WARP 端点"))
+        if self.port:
+            self.port = validate_port(self.port)
+        if not 1280 <= self.mtu <= 1500:
+            raise ConfigError(tr("WARP MTU must be between 1280 and 1500", "WARP MTU 必须在 1280 到 1500 之间"))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"enabled": self.enabled, "tag": self.tag, "endpoint": self.endpoint, "port": self.port, "mtu": self.mtu}
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "WarpSettings":
+        result = cls(
+            enabled=bool(value.get("enabled", False)),
+            tag=str(value.get("tag", "warp")),
+            endpoint=str(value.get("endpoint", "")),
+            port=int(value.get("port", 0)),
+            mtu=int(value.get("mtu", 1280)),
+        )
+        result.validate()
+        return result
+
+
+@dataclass
+class Socks5Settings:
+    enabled: bool = False
+    server: str = ""
+    port: int = 1080
+    username: str = ""
+
+    def validate(self) -> None:
+        if not self.enabled:
+            return
+        if not self.server:
+            raise ConfigError(tr("Socks5 requires a server address", "Socks5 需要服务器地址"))
+        self.server = validate_hostname(self.server, tr("Socks5 server", "Socks5 服务器"))
+        self.port = validate_port(self.port)
+        if self.username and not re.fullmatch(r"[A-Za-z0-9_.@-]{1,128}", self.username):
+            raise ConfigError(tr("Invalid Socks5 username", "Socks5 用户名无效"))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"enabled": self.enabled, "server": self.server, "port": self.port, "username": self.username}
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "Socks5Settings":
+        result = cls(
+            enabled=bool(value.get("enabled", False)),
+            server=str(value.get("server", "")),
+            port=int(value.get("port", 1080)),
+            username=str(value.get("username", "")),
+        )
+        result.validate()
+        return result
+
+
+@dataclass
+class DomainRoute:
+    target: str
+    suffixes: list[str] = field(default_factory=list)
+
+    def validate(self, targets: set[str]) -> None:
+        self.target = self.target.strip().lower()
+        if self.target not in targets:
+            raise ConfigError(tr(f"Route target is not available: {self.target}", f"路由目标不可用：{self.target}"))
+        suffixes = []
+        for suffix in self.suffixes:
+            normalized = _validate_domain_suffix(suffix)
+            if normalized not in suffixes:
+                suffixes.append(normalized)
+        if not suffixes:
+            raise ConfigError(tr("A domain route requires at least one suffix", "域名路由至少需要一个后缀"))
+        self.suffixes = suffixes
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"target": self.target, "suffixes": list(self.suffixes)}
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "DomainRoute":
+        return cls(target=str(value.get("target", "")), suffixes=[str(item) for item in value.get("suffixes", [])])
+
+
+@dataclass
+class RuleSetSettings:
+    tag: str
+    filename: str
+    sha256: str
+    target: str
+    source_url: str = ""
+
+    def validate(self, targets: set[str]) -> None:
+        self.tag = self.tag.strip().lower()
+        if not TAG_PATTERN.fullmatch(self.tag):
+            raise ConfigError(tr(f"Invalid rule-set tag: {self.tag}", f"规则集标签无效：{self.tag}"))
+        self.filename = self.filename.strip().lower()
+        if not RULESET_FILENAME.fullmatch(self.filename):
+            raise ConfigError(tr(f"Invalid rule-set filename: {self.filename}", f"规则集文件名无效：{self.filename}"))
+        self.sha256 = self.sha256.strip().lower()
+        if not SHA256_PATTERN.fullmatch(self.sha256):
+            raise ConfigError(tr("The rule-set SHA256 must be 64 lowercase hex characters", "规则集 SHA256 必须为 64 位小写十六进制"))
+        self.target = self.target.strip().lower()
+        if self.target not in targets:
+            raise ConfigError(tr(f"Rule-set target is not available: {self.target}", f"规则集目标不可用：{self.target}"))
+        if self.source_url:
+            self.source_url = _validate_source_url(self.source_url)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "tag": self.tag,
+            "filename": self.filename,
+            "sha256": self.sha256,
+            "target": self.target,
+            "source_url": self.source_url,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "RuleSetSettings":
+        return cls(
+            tag=str(value.get("tag", "")),
+            filename=str(value.get("filename", "")),
+            sha256=str(value.get("sha256", "")),
+            target=str(value.get("target", "")),
+            source_url=str(value.get("source_url", "")),
+        )
+
+
+@dataclass
+class RoutingSettings:
+    routes: list[DomainRoute] = field(default_factory=list)
+    rule_sets: list[RuleSetSettings] = field(default_factory=list)
+    socks5: Socks5Settings = field(default_factory=Socks5Settings)
+
+    def validate(self, targets: set[str]) -> None:
+        self.socks5.validate()
+        routes: list[DomainRoute] = []
+        for route in self.routes:
+            route.validate(targets)
+            routes.append(route)
+        self.routes = routes
+        rule_sets: list[RuleSetSettings] = []
+        tags: set[str] = set()
+        filenames: set[str] = set()
+        for item in self.rule_sets:
+            item.validate(targets)
+            if item.tag in tags:
+                raise ConfigError(tr(f"Duplicate rule-set tag: {item.tag}", f"规则集标签重复：{item.tag}"))
+            if item.filename in filenames:
+                raise ConfigError(tr(f"Duplicate rule-set filename: {item.filename}", f"规则集文件名重复：{item.filename}"))
+            tags.add(item.tag)
+            filenames.add(item.filename)
+            rule_sets.append(item)
+        self.rule_sets = rule_sets
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "routes": [route.as_dict() for route in self.routes],
+            "rule_sets": [item.as_dict() for item in self.rule_sets],
+            "socks5": self.socks5.as_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "RoutingSettings":
+        return cls(
+            routes=[DomainRoute.from_dict(item) for item in value.get("routes", [])],
+            rule_sets=[RuleSetSettings.from_dict(item) for item in value.get("rule_sets", [])],
+            socks5=Socks5Settings.from_dict(value.get("socks5", {})),
+        )
+
+
 @dataclass
 class ArgoSettings:
     enabled: bool = False
+    mode: str = "token"
     hostname: str = ""
+    local_port: int = 18081
 
     def validate(self) -> None:
-        if self.enabled:
+        self.mode = self.mode.strip().lower() or "token"
+        if self.mode not in ("quick", "token"):
+            raise ConfigError(tr("Argo mode must be quick or token", "Argo 模式只能是 quick 或 token"))
+        self.local_port = validate_port(self.local_port)
+        if self.local_port < 1024:
+            raise ConfigError(tr("The Argo loopback port must be 1024 or higher", "Argo 回环端口必须大于等于 1024"))
+        if self.enabled and self.mode == "token":
+            self.hostname = validate_hostname(self.hostname, tr("Argo public hostname", "Argo 公网域名"))
+        elif self.hostname:
             self.hostname = validate_hostname(self.hostname, tr("Argo public hostname", "Argo 公网域名"))
 
     def as_dict(self) -> dict[str, Any]:
-        return {"enabled": self.enabled, "hostname": self.hostname}
+        return {
+            "enabled": self.enabled,
+            "mode": self.mode,
+            "hostname": self.hostname,
+            "local_port": self.local_port,
+        }
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "ArgoSettings":
-        result = cls(**value)
+        result = cls(
+            enabled=bool(value.get("enabled", False)),
+            mode=str(value.get("mode", "token")),
+            hostname=str(value.get("hostname", "")),
+            local_port=int(value.get("local_port", 18081)),
+        )
         result.validate()
         return result
 
@@ -243,6 +574,8 @@ class Settings:
     port_hopping: dict[str, str] = field(default_factory=dict)
     ddns: DDNSSettings = field(default_factory=DDNSSettings)
     argo: ArgoSettings = field(default_factory=ArgoSettings)
+    warp: WarpSettings = field(default_factory=WarpSettings)
+    routing: RoutingSettings = field(default_factory=RoutingSettings)
     schema_version: int = 2
     protocols: dict[str, ProtocolSettings] = field(default_factory=default_protocols)
     certificate_profiles: list[CertificateProfile] = field(default_factory=list)
@@ -384,8 +717,22 @@ class Settings:
                 ports.append(443)
         return ports
 
+    def route_targets(self) -> set[str]:
+        targets = {"direct", "direct-v4", "direct-v6"}
+        if self.warp.enabled:
+            targets.add(self.warp.tag)
+        if self.routing.socks5.enabled:
+            targets.add("socks5")
+        return targets
+
     def validate(self) -> None:
-        self.schema_version = 2
+        self.schema_version = 3
+        if isinstance(self.argo, dict):
+            self.argo = ArgoSettings.from_dict(self.argo)
+        if isinstance(self.warp, dict):
+            self.warp = WarpSettings.from_dict(self.warp)
+        if isinstance(self.routing, dict):
+            self.routing = RoutingSettings.from_dict(self.routing)
         self.host = normalize_host(self.host)
         target_host, target_port = split_host_port(self.reality_target)
         self.reality_target = format_host_port(target_host, target_port)
@@ -415,24 +762,38 @@ class Settings:
                 ))
         self.ddns.validate()
         self.argo.validate()
+        self.warp.validate()
+        self.routing.validate(self.route_targets())
         if self.ddns.enabled and self.host != self.ddns.record:
             raise ConfigError(tr("When DDNS is enabled, the server address must be the DDNS record", "启用 DDNS 时，服务器地址必须使用 DDNS 记录"))
-        if self.ddns.enabled and self.argo.enabled and self.ddns.record == self.argo.hostname:
+        if self.ddns.enabled and self.argo.enabled and self.argo.mode == "token" and self.ddns.record == self.argo.hostname:
             raise ConfigError(tr("The DDNS record and the Argo hostname must differ: the former must be DNS-only, the latter needs the Cloudflare proxy", "DDNS 记录与 Argo 域名不能相同：前者必须 DNS-only，后者需要 Cloudflare 代理"))
         if self.certificate_mode == "acme" and self.ddns.enabled and self.domain != self.ddns.record:
             raise ConfigError(tr("ACME with DDNS requires the certificate domain to match the DDNS record", "ACME + DDNS 模式要求证书域名与 DDNS 记录一致"))
         if self.argo.enabled:
             if not self.protocols["vmess"].enabled:
                 raise ConfigError(tr("Argo requires the vmess inbound to be enabled", "Argo 要求启用 vmess 入站"))
-            if self.protocols["vmess"].tls_profile:
+            active_ports = {
+                getattr(self.ports, name)
+                for name, protocol in self.protocols.items()
+                if protocol.enabled
+            }
+            if self.argo.local_port in active_ports or self.argo.local_port in acme_ports:
                 raise ConfigError(tr(
-                    "Argo requires the vmess inbound to be plaintext WebSocket; disable VMess TLS before enabling Argo",
-                    "Argo 要求 vmess 入站使用明文 WebSocket；启用 Argo 前请关闭 VMess TLS",
+                    "The Argo loopback port conflicts with an enabled or ACME port",
+                    "Argo 回环端口与已启用端口或 ACME 端口冲突",
                 ))
+            for value in self.port_hopping.values():
+                start, end = value.split(":", 1)
+                if int(start) <= self.argo.local_port <= int(end):
+                    raise ConfigError(tr(
+                        "The Argo loopback port must not be inside a port-hopping range",
+                        "Argo 回环端口不能位于端口跳跃范围内",
+                    ))
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "host": self.host,
             "reality_target": self.reality_target,
             "reality_sni": self.reality_sni,
@@ -446,6 +807,8 @@ class Settings:
             "port_hopping": self.port_hopping,
             "ddns": self.ddns.as_dict(),
             "argo": self.argo.as_dict(),
+            "warp": self.warp.as_dict(),
+            "routing": self.routing.as_dict(),
             "protocols": {name: protocol.as_dict() for name, protocol in self.protocols.items()},
             "certificate_profiles": [profile.as_dict() for profile in self.certificate_profiles],
         }
@@ -475,7 +838,9 @@ class Settings:
             port_hopping=dict(value.get("port_hopping", {})),
             ddns=DDNSSettings.from_dict(value.get("ddns", {})),
             argo=ArgoSettings.from_dict(value.get("argo", {})),
-            schema_version=int(value.get("schema_version", 2)),
+            warp=WarpSettings.from_dict(value.get("warp", {})),
+            routing=RoutingSettings.from_dict(value.get("routing", {})),
+            schema_version=int(value.get("schema_version", 3)),
             protocols=protocols,
             certificate_profiles=profiles,
         )
@@ -497,6 +862,8 @@ class Secrets:
     reality_private_key: str = ""
     reality_public_key: str = ""
     acme_dns_tokens: dict[str, str] = field(default_factory=dict)
+    warp: WarpCredential = field(default_factory=WarpCredential)
+    socks5_password: str = ""
 
     def validate(self) -> None:
         for value in (self.vless_uuid, self.vmess_uuid, self.tuic_uuid):
@@ -516,6 +883,11 @@ class Secrets:
                 raise ConfigError(tr("Invalid ACME token profile ID", "ACME Token 的证书配置 ID 无效"))
             if not isinstance(token, str) or not token or len(token) > 16384 or any(char in token for char in "\r\n\x00"):
                 raise ConfigError(tr(f"The ACME DNS token for {profile_id} is invalid", f"{profile_id} 的 ACME DNS Token 无效"))
+        self.warp.validate()
+        if self.socks5_password and (
+            len(self.socks5_password) > 4096 or any(char in self.socks5_password for char in "\r\n\x00")
+        ):
+            raise ConfigError(tr("The Socks5 password is invalid", "Socks5 密码无效"))
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -531,6 +903,8 @@ class Secrets:
             "reality_private_key": self.reality_private_key,
             "reality_public_key": self.reality_public_key,
             "acme_dns_tokens": dict(self.acme_dns_tokens),
+            "warp": self.warp.as_dict(),
+            "socks5_password": self.socks5_password,
         }
 
     @classmethod
@@ -544,6 +918,11 @@ class Secrets:
                 if not isinstance(raw, dict):
                     raise ConfigError(tr("The ACME DNS token state is invalid", "ACME DNS Token 状态无效"))
                 values[name] = {str(key): str(item) for key, item in raw.items()}
+            elif name == "warp":
+                raw = value[name]
+                if not isinstance(raw, dict):
+                    raise ConfigError(tr("The WARP credential state is invalid", "WARP 凭证状态无效"))
+                values[name] = WarpCredential.from_dict(raw)
             else:
                 values[name] = str(value[name])
         result = cls(**values)

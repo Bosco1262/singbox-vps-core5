@@ -93,19 +93,35 @@ def singbox_unit(settings: Settings) -> str:
     return "\n".join(lines)
 
 
-def argo_unit() -> str:
-    return """[Unit]
+def argo_unit(settings: Settings) -> str:
+    if settings.argo.mode == "quick":
+        command = (
+            "/usr/local/libexec/sbox5/bin/cloudflared tunnel --no-autoupdate "
+            f"--url http://127.0.0.1:{settings.argo.local_port}"
+        )
+        output = (
+            "StandardOutput=append:/var/lib/sbox5/argo/quick.log\n"
+            "StandardError=inherit\n"
+        )
+    else:
+        command = (
+            "/usr/local/libexec/sbox5/bin/cloudflared tunnel --no-autoupdate "
+            "run --token-file /etc/sbox5/secrets/argo.token"
+        )
+        output = "StandardOutput=journal\nStandardError=journal\n"
+    return f"""[Unit]
 Description=sbox5 Cloudflare Tunnel
-After=network-online.target
-Wants=network-online.target
+After=network-online.target sbox5.service
+Wants=network-online.target sbox5.service
 
 [Service]
 Type=simple
 User=sbox5-argo
 Group=sbox5-argo
-ExecStart=/usr/local/libexec/sbox5/bin/cloudflared tunnel --no-autoupdate run --token-file /etc/sbox5/secrets/argo.token
+ExecStart={command}
 Restart=on-failure
 RestartSec=5s
+UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
@@ -121,9 +137,8 @@ SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 CapabilityBoundingSet=
 AmbientCapabilities=
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=sbox5-argo
+ReadWritePaths=/var/lib/sbox5/argo
+{output}SyslogIdentifier=sbox5-argo
 
 [Install]
 WantedBy=multi-user.target

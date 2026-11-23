@@ -9,13 +9,18 @@ from typing import Any
 
 from .errors import ConfigError
 from .i18n import tr
-from .models import CertificateProfile, Secrets, Settings
+from .models import CertificateProfile, RuleSetSettings, Secrets, Settings
 from .util import run, split_host_port
 
 CERTIFICATE_PATH = Path("/etc/sbox5/tls/cert.pem")
 KEY_PATH = Path("/etc/sbox5/tls/key.pem")
 TLS_DIR = Path("/etc/sbox5/tls")
 ACME_STATE_DIR = Path("/var/lib/sbox5/acme")
+RULESET_DIR = Path("/var/lib/sbox5/rulesets")
+
+
+def rule_set_path(item: RuleSetSettings) -> Path:
+    return RULESET_DIR / item.filename
 
 
 def certificate_profile(settings: Settings, profile_id: str) -> CertificateProfile:
@@ -127,6 +132,15 @@ def build_server_config(settings: Settings, secrets: Secrets) -> dict[str, Any]:
         if profile_id:
             vmess["tls"] = _tls(profiles[profile_id])
         inbounds.append(vmess)
+        if settings.argo.enabled:
+            inbounds.append({
+                "type": "vmess",
+                "tag": "vmess-argo-origin",
+                "listen": "127.0.0.1",
+                "listen_port": settings.argo.local_port,
+                "users": [{"name": "vmess-argo", "uuid": secrets.vmess_uuid, "alter_id": 0}],
+                "transport": {"type": "ws", "path": secrets.vmess_path, "max_early_data": 0},
+            })
     if settings.protocols["hysteria2"].enabled:
         inbounds.append({
             "type": "hysteria2",
@@ -165,16 +179,90 @@ def build_server_config(settings: Settings, secrets: Secrets) -> dict[str, Any]:
         for profile in settings.active_certificate_profiles()
         if profile.mode == "acme"
     ]
+    outbounds: list[dict[str, Any]] = [
+        {"type": "direct", "tag": "direct"},
+        {
+            "type": "direct",
+            "tag": "direct-v4",
+            "domain_resolver": {"server": "local", "strategy": "ipv4_only"},
+        },
+        {
+            "type": "direct",
+            "tag": "direct-v6",
+            "domain_resolver": {"server": "local", "strategy": "ipv6_only"},
+        },
+    ]
+    socks5 = settings.routing.socks5
+    if socks5.enabled:
+        outbound: dict[str, Any] = {
+            "type": "socks",
+            "tag": "socks5",
+            "server": socks5.server,
+            "server_port": socks5.port,
+            "version": "5",
+            "domain_resolver": "local",
+        }
+        if socks5.username:
+            if not secrets.socks5_password:
+                raise ConfigError(tr("Socks5 username requires a password", "Socks5 用户名需要密码"))
+            outbound["username"] = socks5.username
+            outbound["password"] = secrets.socks5_password
+        outbounds.append(outbound)
+    endpoints: list[dict[str, Any]] = []
+    if settings.warp.enabled:
+        credential = secrets.warp
+        if not credential.configured:
+            raise ConfigError(tr(
+                "WARP is enabled but no credential is configured; run 'sbox5 warp register' or 'sbox5 warp import' first",
+                "WARP 已启用但未配置凭证；请先运行 sbox5 warp register 或 sbox5 warp import",
+            ))
+        endpoints.append({
+            "type": "wireguard",
+            "tag": settings.warp.tag,
+            "address": list(credential.addresses),
+            "private_key": credential.private_key,
+            "mtu": settings.warp.mtu,
+            "domain_resolver": "local",
+            "peers": [{
+                "address": settings.warp.endpoint or credential.peer_address,
+                "port": settings.warp.port or credential.peer_port,
+                "public_key": credential.peer_public_key,
+                "allowed_ips": ["0.0.0.0/0", "::/0"],
+                "reserved": list(credential.reserved),
+                "persistent_keepalive_interval": 30,
+            }],
+        })
+    rules: list[dict[str, Any]] = [
+        {"action": "sniff"},
+        {"ip_is_private": True, "action": "route", "outbound": "direct"},
+    ]
+    for route in settings.routing.routes:
+        rules.append({"domain_suffix": list(route.suffixes), "action": "route", "outbound": route.target})
+    for item in settings.routing.rule_sets:
+        rules.append({"rule_set": [item.tag], "action": "route", "outbound": item.target})
     config: dict[str, Any] = {
         "log": {"level": "warn", "timestamp": True},
+        "dns": {"servers": [{"type": "local", "tag": "local"}], "final": "local"},
         "inbounds": inbounds,
-        "outbounds": [{"type": "direct", "tag": "direct"}],
+        "outbounds": outbounds,
         "route": {
-            "rules": [{"action": "sniff"}],
+            "rules": rules,
+            "rule_set": [
+                {
+                    "type": "local",
+                    "tag": item.tag,
+                    "format": "binary",
+                    "path": str(rule_set_path(item)),
+                }
+                for item in settings.routing.rule_sets
+            ],
             "final": "direct",
+            "default_domain_resolver": "local",
             "auto_detect_interface": True,
         },
     }
+    if endpoints:
+        config["endpoints"] = endpoints
     if providers:
         config["certificate_providers"] = providers
     return config

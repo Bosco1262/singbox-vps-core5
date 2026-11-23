@@ -74,6 +74,49 @@ def _download_file(url: str, expected: dict[str, Any], allowed_hosts: set[str], 
             temporary.unlink()
 
 
+def download_verified_file(
+    url: str,
+    sha256: str,
+    destination: Path,
+    allowed_hosts: set[str],
+    *,
+    max_size: int = 64 * 1024 * 1024,
+    mode: int = 0o640,
+) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{64}", sha256.lower()):
+        raise VerificationError(tr("The expected SHA256 is invalid", "期望的 SHA256 无效"))
+    _validate_url(url, allowed_hosts)
+    context = ssl.create_default_context()
+    opener = build_opener(HTTPSHandler(context=context), _RestrictedRedirect(allowed_hosts))
+    request = Request(url, headers={"User-Agent": "sbox5/0.1", "Accept": "application/octet-stream"})
+    temporary = destination.with_suffix(destination.suffix + ".part")
+    if temporary.exists() or temporary.is_symlink():
+        temporary.unlink()
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with opener.open(request, timeout=45) as response, temporary.open("xb") as handle:
+            _validate_url(response.geturl(), allowed_hosts)
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > max_size:
+                    raise VerificationError(tr("The downloaded file exceeds the size limit", "下载文件超过大小限制"))
+                digest.update(chunk)
+                handle.write(chunk)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if digest.hexdigest().lower() != sha256.lower():
+            raise VerificationError(tr("SHA256 mismatch for the downloaded file", "下载文件的 SHA256 不符"))
+        atomic_write(destination, temporary.read_bytes(), mode)
+        return destination
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def _verify_optional_signature(asset: dict[str, Any], data_path: Path, project_root: Path, allowed_hosts: set[str]) -> None:
     signature = asset.get("signature")
     if not signature:
@@ -111,8 +154,15 @@ def _safe_archive_member(archive: tarfile.TarFile, member_name: str) -> tarfile.
     return selected
 
 
-def install_locked_binary(component: str, architecture: str, project_root: Path, destination: Path, staging: Path) -> dict[str, Any]:
-    lock_path = project_root / "locks" / f"{component}.json"
+def install_locked_binary(
+    component: str,
+    architecture: str,
+    project_root: Path,
+    destination: Path,
+    staging: Path,
+    lock_path: Path | None = None,
+) -> dict[str, Any]:
+    lock_path = lock_path or (project_root / "locks" / f"{component}.json")
     lock = load_json(lock_path)
     if lock.get("schema_version") != 1 or lock.get("component") != component:
         raise VerificationError(tr(f"Invalid lock file format for {component}", f"{component} 锁文件格式无效"))
