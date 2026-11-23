@@ -4,8 +4,8 @@
 
 [![License: GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://www.python.org/)
-[![Platform: Linux](https://img.shields.io/badge/Platform-Debian%2012%2B%20%7C%20Ubuntu%2022.04%2B-orange.svg)]()
-[![Tests: 73 Passed](https://img.shields.io/badge/Tests-73%20Passed-brightgreen.svg)]()
+[![Platform: Linux](https://img.shields.io/badge/Platform-Debian%2012%2B%20%7C%20Ubuntu%2022.04%2B%20%7C%20Alpine%203.20%2B%20%7C%20RHEL%209%2B-orange.svg)]()
+[![Tests: 88 Passed](https://img.shields.io/badge/Tests-88%20Passed-brightgreen.svg)]()
 
 **singbox-vps-core5** (`sbox5`) is a production-hardened, auditable, and rollback-ready proxy suite for Linux VPS. It enables seamless coexistence of five modern protocols (**VLESS-Reality**, **VMess-WS**, **Hysteria2**, **TUIC v5**, and **AnyTLS**) under strict security isolation, non-root systemd sandboxing, and immutable supply-chain locking.
 
@@ -28,16 +28,20 @@
 - **CDN Preference & Full Client Export**: Optional VMess/Argo CDN preferred IP/domain with explicit Host/SNI; exports SFA, SFI, SFW, sing-box, Mihomo, share links, QR codes, and a Base64 subscription bundle.
 - **Local Subscription Service**: A dedicated non-root `sbox5-sub` service serves only a whitelisted bundle through a high-entropy path token. The server stores only the token hash; localhost + TLS reverse proxy is the default, with optional built-in TLS using a self-signed/imported profile.
 - **Locked Core Lifecycle**: Stable/channel/version switching only accepts immutable lock files, pre-checks the new binary with `sing-box check`, and rolls back automatically on failure.
+- **Operations Console**: `sbox5 menu` provides a live status dashboard, logs, health checks, protocol/port actions, and certificate/subscription views without memorizing flags. `sbox5 doctor --json` gives scriptable PASS/WARN/FAIL results.
+- **Dual-Stack Export Control**: `sbox5 ip set --family ipv4|ipv6|auto` selects which detected global address is written into share links, SFA/SFI/SFW, sing-box client configs, and Mihomo, while the server keeps dual-stack listeners.
+- **Cross-Distro Services**: Debian/Ubuntu/RHEL use hardened systemd units; Alpine uses OpenRC runscripts with dedicated users, file logs, a DDNS loop, and `setcap cap_net_bind_service` only when low ports or native ACME require it.
 - **Zero-Trust TLS**: Self-signed mode automatically inlines certificates into sing-box client configs and binds full SHA256 DER fingerprints in Mihomo (Clash.Meta). No `insecure: true` anywhere.
 
 ---
 
 ## System Requirements
 
-- **OS**: Debian 12+ / Ubuntu 22.04+ (64-bit x86_64 / arm64)
-- **Init**: systemd (PID 1)
+- **OS**: Debian 12+ / Ubuntu 22.04+ / Alpine 3.20+ / RHEL 9+, Rocky 9+, or AlmaLinux 9+ (64-bit x86_64 / arm64)
+- **Init**: systemd on Debian/Ubuntu/RHEL; OpenRC on Alpine
 - **Virtualization**: KVM / Bare-metal (with independent kernel module support)
 - **Runtime**: Python 3.10+ (Standard Library)
+- **Firewall**: UFW, nftables, or iptables. On RHEL with firewalld active, sbox5 refuses to modify firewalld: open ports with `firewall-cmd`, then install with `--no-firewall` or disable firewalld deliberately.
 
 ---
 
@@ -62,6 +66,8 @@ Or invoke the CLI directly:
 sudo ./sbox5 install
 ```
 
+On a minimal Alpine or RHEL image, install Python 3.10+ first with the distribution package manager (`apk add python3` or `dnf install python3`). RHEL 9's default `python3` is 3.9, so install `python3.11` (or newer) from AppStream first; the launcher detects it automatically. The installer then installs the remaining official packages (nftables, iptables, OpenSSL, iproute2, libcap/shadow on Alpine) itself.
+
 ### 2. Command Reference
 
 ```text
@@ -69,7 +75,12 @@ sbox5 <subcommand>
 
   install      Fresh installation (interactive guidance or parameter-driven)
   upgrade      Seamless core component upgrade based on lock files
-  status       Display non-sensitive service status, versions, protocols, and certificate profiles
+  status       Display non-sensitive service status, versions, protocols, and certificate profiles (--geo for optional IP geolocation)
+  menu         Interactive dashboard for status, logs, health checks, and common changes
+  doctor       Run local health checks (--json for automation)
+  logs         Show service logs (--service core|argo|ddns|subscription|firewall, --follow)
+  ip show      Show detected global IPv4/IPv6 addresses
+  ip set       Select auto/ipv4/ipv6 for exported client addresses
   show         Display node credentials and links (--protocol, --json, --qr)
   export       Re-export client configuration files to /var/lib/sbox5/exports
   check        Verify server and client configs with official sing-box binary
@@ -242,9 +253,37 @@ Native ACME certificates cannot be read by the local subscription process; use a
 
 WARP registration uses Cloudflare's client registration endpoint and is never replaced by hard-coded/shared private keys. WARP private keys stay in `secrets/protocols.json` (`0600`) and are injected into `config.json` (`0640 root:sbox5`). Only locked sing-box versions are accepted; add a `locks/versions/<version>.json` file and set `channels.beta` in `locks/versions/index.json` before switching to a beta build.
 
+### Phase 4 operations
+
+```bash
+# Live dashboard and common actions
+sudo sbox5 menu
+
+# Optional public IP geolocation (HTTPS request to ipinfo.io; no credentials are sent)
+sudo sbox5 status --geo
+
+# Logs and health checks
+sudo sbox5 logs --service core --follow
+sudo sbox5 doctor
+sudo sbox5 doctor --json
+
+# Choose the address written into client exports (server listeners stay dual-stack)
+sudo sbox5 ip show
+sudo sbox5 ip set --family ipv6 --yes
+sudo sbox5 ip set --family auto --yes
+```
+
+`ip set` affects share links, SFA/SFI/SFW, sing-box client JSON, and Mihomo; it does not change listen sockets. If the selected family has no global address, the command fails explicitly instead of exporting an empty host.
+
+Platform notes:
+
+- **Alpine / OpenRC**: services are installed as `/etc/init.d/sbox5*` with dedicated users, file logs under `/var/log/sbox5`, and a long-running DDNS loop instead of a systemd timer. Low ports and native ACME HTTP-01/TLS-ALPN-01 use `setcap cap_net_bind_service=+ep` on the project-owned sing-box binary at service start; the `libcap` package is installed automatically.
+- **RHEL / Rocky / AlmaLinux**: sbox5 never edits firewalld zones. If firewalld is running, open the required ports with `firewall-cmd` and install with `--no-firewall`, or deliberately disable firewalld before using the project-owned nftables table. SELinux policy is left to the administrator; `sbox5 doctor` reports service and config failures. QR PNG export uses `qrencode` when the distribution provides it; links and client configs are always exported.
+- **Snapshots**: OpenRC runscripts, `/etc/init.d` changes, service enablement, and the new log directory are captured in the manifest and restored by the offline `recovery/restore.py`.
+
 ---
 
-## Migration Notes (MVP → Phase 3)
+## Migration Notes (MVP → Phase 4)
 
 - `settings.json` / `state.json` are migrated from schema v1/v2 to v3 automatically. Original v1/v2 snapshots remain restorable by their own bundled `restore.py`.
 - Legacy certbot ACME profiles become native sing-box ACME profiles using HTTP-01 by default. The old certbot state under `/etc/sbox5/acme` is preserved but no longer used; the certificate is re-issued by sing-box on the next start.
@@ -252,6 +291,7 @@ WARP registration uses Cloudflare's client registration endpoint and is never re
 - Existing Argo settings are migrated to token mode with the existing hostname. Argo now uses a loopback-only VMess ingress (`18081` by default), so VMess TLS and Argo can coexist; update the Cloudflare ingress to `http://127.0.0.1:18081`.
 - Phase 2 adds native WARP, optional Socks5, local `.srs` rule sets, and locked core switching. `warp-plus` / Psiphon remain intentionally excluded.
 - Phase 3 adds CDN preference, SFA/SFI/SFW exports, and a local subscription service only. GitLab/Telegram push are not included by design; use the tokenized subscription URL from your own HTTPS reverse proxy.
+- Phase 4 adds the interactive menu, logs, doctor, dual-stack export selection, Alpine/OpenRC support, and RHEL 9 compatibility. Firewalld is treated as an administrator-owned boundary and is never modified automatically.
 
 ---
 

@@ -30,6 +30,19 @@ def _stat_metadata(path: Path) -> dict[str, Any]:
 
 
 def _service_state(name: str) -> dict[str, Any]:
+    from .services import init_backend, openrc_name, service_active, service_enabled, service_exists
+
+    backend = init_backend()
+    if backend == "openrc":
+        base = openrc_name(name)
+        return {
+            "name": base,
+            "backend": "openrc",
+            "existed": service_exists(name),
+            "was_active": service_active(name),
+            "was_enabled": service_enabled(name),
+            "was_masked": False,
+        }
     active = run(["systemctl", "is-active", name], check=False).stdout.strip() == "active"
     enabled_result = run(["systemctl", "is-enabled", name], check=False)
     enabled = enabled_result.returncode == 0 and enabled_result.stdout.strip() == "enabled"
@@ -118,7 +131,15 @@ class Snapshot:
             manifest["files"].append(entry)
         for directory in dict.fromkeys(directories):
             manifest["directories"].append({"path": str(directory.absolute()), "existed": directory.absolute().exists()})
-        manifest["services"] = [_service_state(name) for name in dict.fromkeys(services)] if available("systemctl") else []
+        manifest["services"] = []
+        seen_services: set[tuple[str, str]] = set()
+        for name in dict.fromkeys(services):
+            state = _service_state(name)
+            key = (str(state["name"]), str(state["backend"]))
+            if key in seen_services:
+                continue
+            seen_services.add(key)
+            manifest["services"].append(state)
         cls._capture_firewall(path, manifest)
         cls._capture_cron(path, manifest)
         shutil.copyfile(project_root / "recovery" / "restore.py", path / "restore.py")

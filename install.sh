@@ -1,10 +1,10 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Copyright (C) 2026 Bosco1262
 # SPDX-License-Identifier: GPL-3.0-or-later
-set -Eeuo pipefail
+set -eu
 umask 077
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-if (($# == 0)); then
+ROOT=$(CDPATH= cd "$(dirname "$0")" && pwd)
+if [ "$#" -eq 0 ]; then
   set -- install
 fi
-exec bash "$ROOT/sbox5" "$@"
+exec sh "$ROOT/sbox5" "$@"

@@ -4,8 +4,8 @@
 
 [![License: GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://www.python.org/)
-[![Platform: Linux](https://img.shields.io/badge/Platform-Debian%2012%2B%20%7C%20Ubuntu%2022.04%2B-orange.svg)]()
-[![Tests: 73 Passed](https://img.shields.io/badge/Tests-73%20Passed-brightgreen.svg)]()
+[![Platform: Linux](https://img.shields.io/badge/Platform-Debian%2012%2B%20%7C%20Ubuntu%2022.04%2B%20%7C%20Alpine%203.20%2B%20%7C%20RHEL%209%2B-orange.svg)]()
+[![Tests: 88 Passed](https://img.shields.io/badge/Tests-88%20Passed-brightgreen.svg)]()
 
 **singbox-vps-core5** (`sbox5`) 是一个面向 Linux VPS 的生产加固、可审计且支持故障回滚的多协议代理套件。在严苛的安全隔离、非 root systemd 沙盒与不可变供应链锁的保护下，实现五大现代协议（**VLESS-Reality**、**VMess-WS**、**Hysteria2**、**TUIC v5** 与 **AnyTLS**）的原生平滑共存。
 
@@ -28,16 +28,20 @@
 - **CDN 优选与全客户端导出**：支持 VMess/Argo 的 CDN 优选 IP/域名与显式 Host/SNI；导出 SFA、SFI、SFW、sing-box、Mihomo、分享链接、二维码与 Base64 订阅包；
 - **本地订阅服务**：独立低权限 `sbox5-sub` 服务，仅通过高熵路径 Token 提供白名单文件；服务端只保存 Token 哈希；默认 localhost + TLS 反向代理，也可用自签/导入证书启用内置 TLS；
 - **锁定内核生命周期**：稳定版/通道/指定版本切换只接受不可变锁文件，新二进制先通过 `sing-box check`，失败自动回滚；
+- **运维控制台**：`sbox5 menu` 提供状态面板、日志、健康检查、协议/端口操作与证书/订阅视图；`sbox5 doctor --json` 输出可脚本化的 PASS/WARN/FAIL 结果；
+- **双栈导出切换**：`sbox5 ip set --family ipv4|ipv6|auto` 选择写入分享链接、SFA/SFI/SFW、sing-box 客户端与 Mihomo 的全局地址，服务端监听仍保持双栈；
+- **跨发行版服务**：Debian/Ubuntu/RHEL 使用加固 systemd 单元；Alpine 使用 OpenRC runscript、专用用户、文件日志、DDNS 循环，并仅在低端口/原生 ACME 需要时使用 `setcap cap_net_bind_service`；
 - **客户端零降级证书校验**：自签证书内嵌公钥，Mihomo 绑定完整 DER SHA256 指纹，彻底杜绝 `insecure: true` 风险。
 
 ---
 
 ## 系统要求
 
-- **操作系统**：Debian 12+ / Ubuntu 22.04+ (64-bit x86_64 / arm64)
-- **Init 系统**：systemd (PID 1)
+- **操作系统**：Debian 12+ / Ubuntu 22.04+ / Alpine 3.20+ / RHEL 9+、Rocky 9+ 或 AlmaLinux 9+（64-bit x86_64 / arm64）
+- **Init 系统**：Debian/Ubuntu/RHEL 使用 systemd；Alpine 使用 OpenRC
 - **虚拟化架构**：KVM / 物理机（需独立内核模块支持）
-- **运行环境**：Python 3.10+ (标准库)
+- **运行环境**：Python 3.10+（标准库）
+- **防火墙**：UFW、nftables 或 iptables。RHEL 上 firewalld 运行时 sbox5 不会修改 firewalld：请先用 `firewall-cmd` 开放端口，再使用 `--no-firewall` 安装，或明确停用 firewalld。
 
 ---
 
@@ -63,6 +67,8 @@ sudo ./install.sh
 sudo ./sbox5 install
 ```
 
+在最小化 Alpine 或 RHEL 镜像上，请先用发行版官方包管理器安装 Python 3.10+（`apk add python3` 或 `dnf install python3`）。RHEL 9 默认的 `python3` 是 3.9，请先从 AppStream 安装 `python3.11`（或更新版本），启动器会自动识别。安装器随后会自行安装其余官方软件包（nftables、iptables、OpenSSL、iproute2，以及 Alpine 的 libcap/shadow）。
+
 ### 2. 命令参考
 
 ```text
@@ -70,7 +76,12 @@ sbox5 <subcommand>
 
   install      全新安装（支持交互式引导或全参数自动安装）
   upgrade      按 locks 锁文件无缝升级核心程序（复用原有配置）
-  status       查看服务状态、组件版本、协议与证书配置
+  status       查看服务状态、组件版本、协议与证书配置（--geo 可选查询 IP 归属地）
+  menu         交互式面板：状态、日志、健康检查与常用操作
+  doctor       本地健康检查（--json 便于自动化）
+  logs         查看服务日志（--service core|argo|ddns|subscription|firewall，--follow）
+  ip show      显示探测到的全局 IPv4/IPv6 地址
+  ip set       选择 auto/ipv4/ipv6 作为客户端导出地址
   show         查看节点链接（--protocol 筛选, --json 输出, --qr 终端渲染二维码）
   export       重新生成客户端配置文件到 /var/lib/sbox5/exports
   check        调用 sing-box 官方二进制校验服务端与客户端配置有效性
@@ -245,9 +256,37 @@ VMess CDN 要求源站 VMess 入站保持明文 WebSocket；Argo CDN 要求 toke
 
 WARP 注册使用 Cloudflare 客户端注册端点，绝不会回退到硬编码/共享私钥；WARP 私钥保存在 `secrets/protocols.json`（`0600`），并会注入 `config.json`（`0640 root:sbox5`）。内核只接受已锁定版本；切换测试版前需添加 `locks/versions/<version>.json` 并在 `locks/versions/index.json` 设置 `channels.beta`。
 
+### Phase 4 运维
+
+```bash
+# 交互式状态面板与常用操作
+sudo sbox5 menu
+
+# 可选的公网 IP 归属地查询（通过 HTTPS 访问 ipinfo.io，不发送任何凭据）
+sudo sbox5 status --geo
+
+# 日志与健康检查
+sudo sbox5 logs --service core --follow
+sudo sbox5 doctor
+sudo sbox5 doctor --json
+
+# 选择写入客户端导出的地址（服务端仍保持双栈监听）
+sudo sbox5 ip show
+sudo sbox5 ip set --family ipv6 --yes
+sudo sbox5 ip set --family auto --yes
+```
+
+`ip set` 只影响分享链接、SFA/SFI/SFW、sing-box 客户端 JSON 与 Mihomo，不改变监听套接字。所选地址族没有全局地址时会明确失败，不会导出空主机名。
+
+平台说明：
+
+- **Alpine / OpenRC**：服务安装为 `/etc/init.d/sbox5*`，使用专用用户、`/var/log/sbox5` 文件日志，并以常驻 DDNS 循环替代 systemd timer。低端口或原生 ACME HTTP-01/TLS-ALPN-01 在服务启动时对项目自有 sing-box 二进制执行 `setcap cap_net_bind_service=+ep`，并自动安装 `libcap`。
+- **RHEL / Rocky / AlmaLinux**：sbox5 不会修改 firewalld 区域。firewalld 运行时应先用 `firewall-cmd` 开放端口并使用 `--no-firewall` 安装，或明确停用 firewalld 后再使用项目自有 nftables 表。SELinux 策略由管理员负责；`sbox5 doctor` 会报告服务与配置故障。发行版提供 `qrencode` 时导出二维码 PNG；分享链接与客户端配置始终会导出。
+- **快照**：OpenRC runscript、`/etc/init.d` 变更、服务启用状态与新日志目录都会写入 manifest，并可由离线 `recovery/restore.py` 恢复。
+
 ---
 
-## MVP → Phase 3 迁移说明
+## MVP → Phase 4 迁移说明
 
 - `settings.json` / `state.json` 会自动从 schema v1/v2 迁移到 v3；原有 v1/v2 快照仍由其自带的 `restore.py` 恢复。
 - 旧的 certbot ACME 配置会迁移为 sing-box 原生 ACME，默认使用 HTTP-01。旧 `/etc/sbox5/acme` 状态会保留但不再使用；sing-box 会在下次启动时重新签发证书。
@@ -255,6 +294,7 @@ WARP 注册使用 Cloudflare 客户端注册端点，绝不会回退到硬编码
 - 原有 Argo 配置会迁移为 token 模式并保留域名。Argo 现在使用回环 VMess 入口（默认 `18081`），因此 VMess TLS 与 Argo 可以共存；请将 Cloudflare ingress 更新为 `http://127.0.0.1:18081`。
 - Phase 2 新增原生 WARP、可选 Socks5、本地 `.srs` 规则集与锁定内核切换；`warp-plus` / Psiphon 仍明确排除。
 - Phase 3 新增 CDN 优选、SFA/SFI/SFW 导出与**仅本地**订阅服务。按设计不包含 GitLab/Telegram 推送；请通过自己的 HTTPS 反向代理发布带 Token 的订阅 URL。
+- Phase 4 新增交互菜单、日志、doctor、双栈导出选择、Alpine/OpenRC 与 RHEL 9 兼容。firewalld 被视为管理员边界，sbox5 绝不自动修改。
 
 ---
 

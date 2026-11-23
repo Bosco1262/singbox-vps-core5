@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import platform
+import sys
 from typing import Any
 
 from .errors import ConfigError, ExternalCommandError
@@ -23,33 +24,82 @@ def architecture() -> str:
     raise ConfigError(tr(f"Unsupported CPU architecture: {machine}", f"不支持的 CPU 架构：{machine}"))
 
 
-def preflight() -> None:
-    require_linux_root()
-    if not Path("/etc/os-release").is_file() or not Path("/proc/1/comm").is_file():
-        raise ConfigError(tr("Only systemd Linux is supported", "仅支持 systemd Linux"))
-    release = {}
+def _release() -> dict[str, str]:
+    release: dict[str, str] = {}
     for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
         key, separator, value = line.partition("=")
         if separator:
             release[key] = value.strip().strip('"')
-    distro = release.get("ID", "")
-    version = release.get("VERSION_ID", "")
+    return release
+
+
+def _version_numbers(version: str) -> tuple[int, ...]:
     try:
-        numbers = tuple(int(part) for part in version.split("."))
+        return tuple(int(part) for part in version.split(".") if part.isdigit())
     except ValueError as exc:
         raise ConfigError(tr("Unable to identify the system version", "无法识别系统版本")) from exc
-    supported = (distro == "debian" and numbers >= (12,)) or (distro == "ubuntu" and numbers >= (22, 4))
-    if not supported:
-        raise ConfigError(tr("The initial release supports only Debian 12+ or Ubuntu 22.04+", "首版仅支持 Debian 12+ 或 Ubuntu 22.04+"))
-    if Path("/proc/1/comm").read_text(encoding="utf-8").strip() != "systemd" or not available("systemctl"):
-        raise ConfigError(tr("PID 1 must be systemd", "PID 1 必须是 systemd"))
+
+
+def _family(release: dict[str, str]) -> str:
+    distro = release.get("ID", "").lower()
+    likes = release.get("ID_LIKE", "").lower().split()
+    if distro in ("debian", "ubuntu"):
+        return "debian"
+    if distro == "alpine":
+        return "alpine"
+    if distro in ("rhel", "rocky", "almalinux", "centos", "ol") or "rhel" in likes:
+        return "rhel"
+    return ""
+
+
+def package_manager() -> str:
+    if available("apt-get") and available("dpkg-query"):
+        return "apt"
+    if available("apk"):
+        return "apk"
+    if available("dnf") or available("yum"):
+        return "dnf"
+    raise ConfigError(tr("No supported official package manager was found", "找不到受支持的官方包管理器"))
+
+
+def preflight() -> None:
+    require_linux_root()
+    if sys.version_info < (3, 10):
+        raise ConfigError(tr("Python 3.10 or later is required", "需要 Python 3.10 或更高版本"))
+    if not Path("/etc/os-release").is_file() or not Path("/proc/1/comm").is_file():
+        raise ConfigError(tr("A supported Linux distribution is required", "需要受支持的 Linux 发行版"))
+    release = _release()
+    distro = release.get("ID", "")
+    version = release.get("VERSION_ID", "")
+    numbers = _version_numbers(version)
+    family = _family(release)
+    if family == "debian":
+        supported = (distro == "debian" and numbers >= (12,)) or (distro == "ubuntu" and numbers >= (22, 4))
+        if not supported:
+            raise ConfigError(tr("Debian 12+ or Ubuntu 22.04+ is required", "需要 Debian 12+ 或 Ubuntu 22.04+"))
+    elif family == "alpine":
+        if numbers < (3, 20):
+            raise ConfigError(tr("Alpine 3.20+ is required", "需要 Alpine 3.20+"))
+    elif family == "rhel":
+        if numbers < (9,):
+            raise ConfigError(tr("RHEL 9+, Rocky 9+, or AlmaLinux 9+ is required", "需要 RHEL 9+、Rocky 9+ 或 AlmaLinux 9+"))
+    else:
+        raise ConfigError(tr(f"Unsupported distribution: {distro or 'unknown'}", f"不支持的发行版：{distro or 'unknown'}"))
+    from .services import init_backend
+    backend = init_backend()
+    if family == "alpine":
+        if backend != "openrc" or not Path("/sbin/openrc-run").exists():
+            raise ConfigError(tr("Alpine must boot with OpenRC; containers without an init system are not supported", "Alpine 必须使用 OpenRC 启动；不支持无 init 的容器"))
+    elif backend != "systemd" or Path("/proc/1/comm").read_text(encoding="utf-8").strip() != "systemd":
+        raise ConfigError(tr("PID 1 must be systemd on Debian/Ubuntu/RHEL", "Debian/Ubuntu/RHEL 的 PID 1 必须是 systemd"))
     if available("systemd-detect-virt"):
         result = run(["systemd-detect-virt"], check=False)
         virtualization = result.stdout.strip()
         if virtualization not in ("", "none", "kvm"):
-            raise ConfigError(tr(f"The initial release supports only KVM or VPS environments with an independent kernel; the current one is {virtualization}", f"首版仅支持 KVM 或独立内核 VPS，当前环境为 {virtualization}"))
-    if not available("apt-get") or not available("dpkg-query"):
-        raise ConfigError(tr("The official APT package manager was not found", "找不到系统官方 APT 包管理器"))
+            raise ConfigError(tr(f"Only KVM or VPS environments with an independent kernel are supported; the current one is {virtualization}", f"仅支持 KVM 或独立内核 VPS，当前环境为 {virtualization}"))
+    wanted_manager = {"debian": "apt", "alpine": "apk", "rhel": "dnf"}[family]
+    if package_manager() != wanted_manager:
+        raise ConfigError(tr("The distribution's official package manager was not found", "找不到该发行版的官方包管理器"))
     architecture()
 
 
@@ -76,24 +126,47 @@ def check_ports(settings: Settings) -> None:
         raise ConfigError(tr("The following ports are already in use: ", "以下端口已被占用：") + tr(", ", "、").join(occupied))
 
 
-def _package_installed(name: str) -> bool:
-    result = run(["dpkg-query", "-W", "-f=${Status}", name], check=False)
-    return result.returncode == 0 and result.stdout.strip() == "install ok installed"
+def _package_installed(name: str, manager: str | None = None) -> bool:
+    manager = manager or package_manager()
+    if manager == "apt":
+        result = run(["dpkg-query", "-W", "-f=${Status}", name], check=False)
+        return result.returncode == 0 and result.stdout.strip() == "install ok installed"
+    if manager == "apk":
+        return run(["apk", "info", "-e", name], check=False).returncode == 0
+    return run(["rpm", "-q", "--quiet", name], check=False).returncode == 0
 
 
 def ensure_packages(settings: Settings) -> dict[str, Any]:
-    packages = ["ca-certificates", "python3", "openssl", "nftables", "iptables", "qrencode"]
-    missing = [name for name in packages if not _package_installed(name)]
+    manager = package_manager()
+    if manager == "apt":
+        packages = ["ca-certificates", "python3", "openssl", "nftables", "iptables", "qrencode", "iproute2"]
+    elif manager == "apk":
+        packages = ["ca-certificates", "python3", "openssl", "nftables", "iptables", "qrencode", "libcap", "iproute2", "shadow"]
+    else:
+        packages = ["ca-certificates", "python3", "openssl", "nftables", "iptables-nft", "iproute"]
+    missing = [name for name in packages if not _package_installed(name, manager)]
     if missing:
-        environment = dict(os.environ)
-        environment["DEBIAN_FRONTEND"] = "noninteractive"
-        run(["apt-get", "update"], timeout=600, env=environment)
-        run(["apt-get", "install", "-y", "--no-install-recommends", *missing], timeout=900, env=environment)
+        if manager == "apt":
+            environment = dict(os.environ)
+            environment["DEBIAN_FRONTEND"] = "noninteractive"
+            run(["apt-get", "update"], timeout=600, env=environment)
+            run(["apt-get", "install", "-y", "--no-install-recommends", *missing], timeout=900, env=environment)
+            note = tr("APT dependencies pulled in automatically are never downgraded or removed automatically", "APT 自动安装的依赖不自动降级或删除")
+        elif manager == "apk":
+            run(["apk", "add", "--no-cache", *missing], timeout=900)
+            note = tr("APK dependencies are kept after uninstall; no third-party repositories are added", "APK 依赖在卸载后保留；不会添加第三方软件源")
+        else:
+            command = "dnf" if available("dnf") else "yum"
+            run([command, "install", "-y", "--setopt=install_weak_deps=False", *missing], timeout=900)
+            note = tr("DNF/RPM dependencies are kept after uninstall; EPEL and third-party repositories are not used", "DNF/RPM 依赖在卸载后保留；不使用 EPEL 或第三方软件源")
+    else:
+        note = tr("All required packages were already installed", "所有依赖包均已安装")
     return {
         "installed_by_project": missing,
         "upgraded_by_project": [],
         "removal_policy": "keep",
-        "note": tr("APT dependencies pulled in automatically are never downgraded or removed automatically", "APT 自动升级的依赖不自动降级或删除"),
+        "package_manager": manager,
+        "note": note,
     }
 
 

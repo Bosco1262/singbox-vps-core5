@@ -1,21 +1,31 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Copyright (C) 2026 Bosco1262
 # SPDX-License-Identifier: GPL-3.0-or-later
-set -Eeuo pipefail
+set -eu
 umask 077
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-if ! command -v python3 >/dev/null 2>&1; then
-  language="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
-  previous=""
-  for argument in "$@"; do
-    case "$previous" in
-      -l|--lang|--language) language="$argument" ;;
-    esac
-    case "$argument" in
-      -l=*|--lang=*|--language=*) language="${argument#*=}" ;;
-    esac
-    previous="$argument"
+ROOT=$(CDPATH= cd "$(dirname "$0")" && pwd)
+language="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
+previous=""
+for argument in "$@"; do
+  case "$previous" in
+    -l|--lang|--language) language="$argument" ;;
+  esac
+  case "$argument" in
+    -l=*|--lang=*|--language=*) language="${argument#*=}" ;;
+  esac
+  previous="$argument"
+done
+PYTHON=${SBOX5_PYTHON:-}
+if [ -z "$PYTHON" ]; then
+  for candidate in python3 python3.12 python3.11 python3.10; do
+    if command -v "$candidate" >/dev/null 2>&1 && \
+       "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+      PYTHON=$candidate
+      break
+    fi
   done
+fi
+if [ -z "$PYTHON" ]; then
   case "$language" in
     zh*|ZH*|Zh*|zH*) message='错误：需要 Python 3.10 或更高版本。请先从系统官方仓库安装 python3。' ;;
     *) message='Error: Python 3.10 or later is required. Install python3 from the official system repository first.' ;;
@@ -23,4 +33,4 @@ if ! command -v python3 >/dev/null 2>&1; then
   printf '%s\n' "$message" >&2
   exit 1
 fi
-exec python3 -I "$ROOT/src/main.py" --project-root "$ROOT" "$@"
+exec "$PYTHON" -I "$ROOT/src/main.py" --project-root "$ROOT" "$@"

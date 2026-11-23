@@ -24,7 +24,7 @@ from .installer import (
     managed_files,
 )
 from .models import Settings
-from .services import require_active
+from .services import require_active, service_start, service_stop
 from .snapshot import SNAPSHOT_ROOT, Snapshot, prune_snapshots
 from .system import architecture
 from .util import atomic_json, atomic_write, load_json, run
@@ -141,7 +141,7 @@ def _activate(
             if not old_cache.exists():
                 atomic_write(old_cache, old_data, 0o755)
                 _track(snapshot, old_cache)
-        run(["systemctl", "stop", "sbox5.service"], check=False, timeout=90)
+        service_stop("sbox5.service")
         config_path = Path("/etc/sbox5/config.json")
         if cached_binary is not None:
             if not cached_binary.is_file():
@@ -180,7 +180,7 @@ def _activate(
             main_state.setdefault("components", {})["sing-box"] = component
             atomic_json(STATE_PATH, main_state, 0o600)
             _track(snapshot, STATE_PATH)
-        run(["systemctl", "start", "sbox5.service"], timeout=90)
+        service_start("sbox5.service")
         require_active("sbox5.service")
         snapshot.commit()
         try:

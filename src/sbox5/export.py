@@ -14,6 +14,7 @@ from .config import certificate_profile, profile_certificate_path
 from .errors import ConfigError
 from .i18n import tr
 from .models import Secrets, Settings
+from .network import effective_settings
 from .util import atomic_json, atomic_text, available, format_host_port, run
 
 
@@ -50,6 +51,7 @@ def build_client_outbounds(
     certificate_pems: dict[str, str] | None = None,
     argo_host: str = "",
 ) -> list[dict[str, Any]]:
+    settings = effective_settings(settings)
     host = settings.host
     certificate_pems = certificate_pems or {}
     inbounds: list[dict[str, Any]] = []
@@ -229,6 +231,7 @@ def build_share_links(
     certificates: dict[str, dict[str, Any]] | None = None,
     argo_host: str = "",
 ) -> dict[str, str]:
+    settings = effective_settings(settings)
     host = settings.host
     resolved_argo_host = argo_host or settings.argo.hostname
     links: dict[str, str] = {}
@@ -318,6 +321,7 @@ def build_mihomo(
     certificates: dict[str, dict[str, Any]] | None = None,
     argo_host: str = "",
 ) -> dict[str, Any]:
+    settings = effective_settings(settings)
     host = settings.host
     resolved_argo_host = argo_host or settings.argo.hostname
     proxies: list[dict[str, Any]] = []

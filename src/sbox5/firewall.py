@@ -61,6 +61,13 @@ def _ufw_active() -> bool:
     return result.returncode == 0 and "status: active" in result.stdout.lower()
 
 
+def _firewalld_active() -> bool:
+    if not available("firewall-cmd"):
+        return False
+    result = run(["firewall-cmd", "--state"], check=False)
+    return result.returncode == 0 and result.stdout.strip() == "running"
+
+
 def _ufw_resources(settings: Settings) -> list[dict[str, Any]]:
     return [
         {"kind": "ufw-rule", "port": str(item["port"]), "protocol": item["protocol"], "name": item["name"]}
@@ -290,6 +297,11 @@ def apply_firewall(settings: Settings, state_path: Path | None = None, on_change
     desired: list[dict[str, Any]] = []
     use_nft = False
     previous_nft = any(item.get("kind") == "nft-table" and item.get("name") == TABLE_NAME for item in previous_owned)
+    if _firewalld_active() and not previous_nft:
+        raise ConflictError(tr(
+            "firewalld is running. sbox5 does not modify firewalld or its zones: open the required ports with firewall-cmd, then install with --no-firewall or set manage_firewall to false",
+            "firewalld 正在运行。sbox5 不会修改 firewalld 或其区域：请使用 firewall-cmd 开放所需端口，然后使用 --no-firewall 安装或把 manage_firewall 设为 false",
+        ))
     if _ufw_active():
         backend = "ufw"
         desired += _ufw_resources(settings)

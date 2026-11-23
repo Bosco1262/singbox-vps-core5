@@ -21,6 +21,7 @@ from .installer import (
     managed_files,
     _managed_directories,
 )
+from .services import reload_systemd, service_disable, service_stop
 from .snapshot import SNAPSHOT_ROOT, Snapshot, prune_snapshots
 from .util import available, load_json, require_linux_root, run
 
@@ -79,8 +80,8 @@ def uninstall(args: argparse.Namespace) -> int:
     snapshot.commit()
     try:
         for name in UNITS:
-            run(["systemctl", "stop", name], check=False)
-            run(["systemctl", "disable", name], check=False)
+            service_stop(name)
+            service_disable(name)
         settings.manage_firewall = False
         apply_firewall(settings, FIREWALL_STATE_PATH)
         if FIREWALL_STATE_PATH.is_file():
@@ -112,7 +113,7 @@ def uninstall(args: argparse.Namespace) -> int:
                 run(["groupdel", name["name"]], check=False)
         preserved = {
             SNAPSHOT_ROOT, Path("/var/lib/sbox5"), Path("/var/lib/sbox5/acme"),
-            Path("/etc/sbox5/acme"), Path("/var/log/sbox5-acme"),
+            Path("/etc/sbox5/acme"), Path("/var/log/sbox5-acme"), Path("/var/log/sbox5"),
         }
         for item in sorted(_managed_directories(settings), key=lambda path: len(path.parts), reverse=True):
             if item in preserved or any(parent in preserved for parent in item.parents):
@@ -122,7 +123,7 @@ def uninstall(args: argparse.Namespace) -> int:
                     item.rmdir()
                 except OSError:
                     pass
-        run(["systemctl", "daemon-reload"], check=True)
+        reload_systemd()
     except Exception as exc:
         try:
             _rollback(snapshot)

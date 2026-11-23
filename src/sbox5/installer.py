@@ -45,8 +45,20 @@ from .services import (
     ensure_system_user,
     firewall_unit,
     identity,
+    init_backend,
+    install_service,
+    openrc_argo,
+    openrc_ddns,
+    openrc_firewall,
+    openrc_name,
+    openrc_singbox,
+    openrc_subscription,
     reload_systemd,
     require_active,
+    service_disable,
+    service_exists,
+    service_path,
+    service_stop,
     singbox_unit,
     subscription_unit,
 )
@@ -61,7 +73,7 @@ from .subscription import (
     token_hash,
 )
 from .system import architecture, check_ports, configure_bbr, ensure_packages, preflight
-from .util import atomic_json, atomic_text, atomic_write, load_json, run, sha256_file
+from .util import atomic_json, atomic_write, load_json, run, sha256_file
 
 CONFIG_DIR = Path("/etc/sbox5")
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
@@ -72,6 +84,11 @@ DDNS_TOKEN_PATH = CONFIG_DIR / "secrets/cloudflare.token"
 STATE_DIR = Path("/var/lib/sbox5")
 STATE_PATH = STATE_DIR / "state.json"
 FIREWALL_STATE_PATH = STATE_DIR / "firewall.json"
+LOG_DIR = Path("/var/log/sbox5")
+SINGBOX_LOG_PATH = LOG_DIR / "sing-box.log"
+ARGO_SERVICE_LOG_PATH = LOG_DIR / "argo.log"
+DDNS_LOG_PATH = LOG_DIR / "ddns.log"
+SUBSCRIPTION_LOG_PATH = LOG_DIR / "subscription.log"
 CERTIFICATE_STATE_PATH = STATE_DIR / "certificate.json"
 CERTIFICATES_STATE_PATH = STATE_DIR / "certificates.json"
 DDNS_STATE_PATH = STATE_DIR / "ddns/last.json"
@@ -119,6 +136,7 @@ def managed_files(settings: Settings | None = None) -> list[Path]:
         SUBSCRIPTION_CONFIG_PATH, SUBSCRIPTION_TOKEN_PATH,
         SYSCTL_PATH, Path("/usr/local/bin/sbox5"), SINGBOX_BINARY, CLOUDFLARED_BINARY,
         *(UNIT_DIR / name for name in UNITS),
+        *(service_path(name) for name in UNITS),
     }
     if settings is not None:
         for profile in settings.certificate_profiles:
@@ -137,7 +155,7 @@ def _managed_directories(settings: Settings | None = None) -> list[Path]:
         CONFIG_DIR, CONFIG_DIR / "secrets", CONFIG_DIR / "tls", CONFIG_DIR / "tls" / "default",
         STATE_DIR, SNAPSHOT_ROOT, STATE_DIR / "ddns", STATE_DIR / "exports", ACME_STATE_DIR,
         ACME_STATE_DIR / "default", ARGO_DIR, RULESET_DIR, SUBSCRIPTION_BUNDLE_DIR, SUBSCRIPTION_TLS_DIR,
-        Path("/var/lib/sbox5-runtime"),
+        Path("/var/lib/sbox5-runtime"), LOG_DIR,
         Path("/usr/local/libexec/sbox5"), Path("/usr/local/libexec/sbox5/app"), BINARY_DIR, CORE_CACHE_DIR,
     ]
     if settings is not None:
@@ -210,15 +228,26 @@ class InstallTransaction:
     def _mkdir(self, path: Path, mode: int, uid: int | None = None, gid: int | None = None) -> None:
         path.mkdir(parents=True, exist_ok=True, mode=mode)
         if path.is_symlink():
-            raise ConflictError(tr(f"A project directory must not be a symbolic link: {path}", f"项目目录不能是符号链接：{path}"))
+            raise ConflictError(tr("A project directory must not be a symbolic link: ", "项目目录不能是符号链接：") + str(path))
         os.chmod(path, mode)
         if uid is not None and gid is not None:
             os.chown(path, uid, gid)
 
+    def _ensure_log(self, path: Path, uid: int, gid: int) -> None:
+        if path.is_symlink():
+            raise ConflictError(tr("A project log file must not be a symbolic link: ", "项目日志文件不能是符号链接：") + str(path))
+        if path.exists() and not path.is_file():
+            raise ConflictError(tr("A project log path is not a regular file: ", "项目日志路径不是普通文件：") + str(path))
+        if not path.exists():
+            atomic_write(path, b"", 0o600, uid, gid)
+            return
+        os.chmod(path, 0o600)
+        os.chown(path, uid, gid)
+
     def _stop_existing_services(self) -> None:
         for name in UNITS:
-            if (UNIT_DIR / name).exists():
-                run(["systemctl", "stop", name], check=False)
+            if service_exists(name):
+                service_stop(name)
 
     def _create_users(self) -> None:
         assert self.snapshot is not None
@@ -384,6 +413,24 @@ class InstallTransaction:
             self.sysctls = []
 
     def _install_units(self) -> None:
+        if init_backend() == "openrc":
+            desired: dict[str, str] = {"sbox5": openrc_singbox(self.settings)}
+            if self.settings.argo.enabled:
+                desired["sbox5-argo"] = openrc_argo(self.settings)
+            if self.settings.ddns.enabled:
+                desired["sbox5-ddns"] = openrc_ddns()
+            if needs_firewall_service(self.settings):
+                desired["sbox5-firewall"] = openrc_firewall()
+            if self.settings.subscription.enabled:
+                desired["sbox5-subscription"] = openrc_subscription()
+            known = {openrc_name(name) for name in UNITS}
+            for name in known - set(desired):
+                service_disable(name)
+                self._remove(service_path(name))
+            for name, content in desired.items():
+                path = install_service(name, "", content)
+                self._record(path)
+            return
         desired: dict[str, str] = {"sbox5.service": singbox_unit(self.settings)}
         if self.settings.argo.enabled:
             desired["sbox5-argo.service"] = argo_unit(self.settings)
@@ -397,7 +444,7 @@ class InstallTransaction:
         for name in UNITS:
             path = UNIT_DIR / name
             if name in desired:
-                atomic_text(path, desired[name], 0o644)
+                install_service(name, desired[name], "")
                 self._record(path)
             else:
                 run(["systemctl", "disable", name], check=False)
@@ -425,7 +472,8 @@ class InstallTransaction:
         argo_state: dict[str, Any] = {}
         fresh_markers = (
             CONFIG_DIR, Path("/usr/local/libexec/sbox5"), STATE_DIR,
-            Path("/usr/local/bin/sbox5"), SYSCTL_PATH, *(UNIT_DIR / name for name in UNITS),
+            Path("/usr/local/bin/sbox5"), SYSCTL_PATH,
+            *(UNIT_DIR / name for name in UNITS), *(service_path(name) for name in UNITS),
         )
         if self.upgrade or self.reconfigure:
             if not SETTINGS_PATH.is_file() or not SECRETS_PATH.is_file() or not STATE_PATH.is_file():
@@ -475,10 +523,17 @@ class InstallTransaction:
             self._mkdir(STATE_DIR, 0o711)
             self._mkdir(SNAPSHOT_ROOT, 0o700)
             self._mkdir(EXPORT_DIR, 0o700)
+            self._mkdir(LOG_DIR, 0o755)
             self._mkdir(Path("/var/lib/sbox5-runtime"), 0o700, singbox_uid, singbox_gid)
+            self._ensure_log(SINGBOX_LOG_PATH, singbox_uid, singbox_gid)
+            if self.settings.argo.enabled:
+                self._ensure_log(ARGO_LOG_PATH if self.settings.argo.mode == "quick" else ARGO_SERVICE_LOG_PATH, argo_uid, argo_gid)
             if self.settings.ddns.enabled:
                 ddns_uid, ddns_gid = identity("sbox5-ddns")
                 self._mkdir(STATE_DIR / "ddns", 0o700, ddns_uid, ddns_gid)
+                self._ensure_log(DDNS_LOG_PATH, ddns_uid, ddns_gid)
+            if self.settings.subscription.enabled:
+                self._ensure_log(SUBSCRIPTION_LOG_PATH, subscription_uid, subscription_gid)
             self._mkdir(BINARY_DIR, 0o755)
             self._write_tokens()
             self._write_settings()
@@ -602,7 +657,7 @@ class InstallTransaction:
             check_server_config(SINGBOX_BINARY, EXPORT_DIR / "sfa.json")
             self._configure_sysctl()
             self._install_units()
-            if (UNIT_DIR / "sbox5-firewall.service").exists():
+            if service_exists("sbox5-firewall.service"):
                 enable_start("sbox5-firewall.service")
                 require_active("sbox5-firewall.service")
             enable_start("sbox5.service")
@@ -646,10 +701,14 @@ class InstallTransaction:
                 enable_start("sbox5-subscription.service")
                 require_active("sbox5-subscription.service")
             if self.settings.ddns.enabled:
-                run(["systemctl", "start", "sbox5-ddns.service"], timeout=180)
+                if init_backend() == "openrc":
+                    enable_start("sbox5-ddns.service")
+                    require_active("sbox5-ddns.service")
+                else:
+                    run(["systemctl", "start", "sbox5-ddns.service"], timeout=180)
+                    enable_start("sbox5-ddns.timer")
+                    require_active("sbox5-ddns.timer")
                 self._record(DDNS_STATE_PATH)
-                enable_start("sbox5-ddns.timer")
-                require_active("sbox5-ddns.timer")
             self.snapshot.record_nft_owned("after")
             for entry in self.snapshot.manifest["files"]:
                 path = Path(entry["path"])

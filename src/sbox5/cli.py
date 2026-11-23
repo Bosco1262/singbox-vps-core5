@@ -10,11 +10,14 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 from . import __version__
 from .argo import argo_host, quick_url_from_log, read_state as read_argo_state, wait_for_quick_url, write_state as write_argo_state
 from .config import CERTIFICATE_PATH, check_server_config
+from .dashboard import render_text as render_dashboard, status_data as dashboard_status
 from .ddns import CloudflareDDNS
+from .doctor import doctor_data, render_checks
 from .errors import ConfigError, SBox5Error
 from .export import build_share_links, export_nodes
 from .firewall import apply_firewall
@@ -56,7 +59,16 @@ from .models import (
     Socks5Settings,
     WarpCredential,
 )
-from .services import identity, require_active
+from .network import geolocation_summary, summary as network_summary
+from .services import (
+    identity,
+    require_active,
+    service_exists,
+    service_logs_command,
+    service_start,
+    service_state_text,
+    service_stop,
+)
 from .snapshot import SNAPSHOT_ROOT
 from .subscription import (
     BUNDLE_DIR as SUBSCRIPTION_BUNDLE_DIR,
@@ -322,11 +334,14 @@ def _install(args: argparse.Namespace, upgrade: bool) -> int:
     return 0
 
 
-def _status() -> int:
+def _status(args: argparse.Namespace) -> int:
     require_linux_root()
     state = load_json(STATE_PATH)
     settings = load_settings()
     secrets = load_secrets()
+    if args.geo:
+        print(json.dumps({"geolocation": geolocation_summary()}, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
     argo_state = read_argo_state(ARGO_STATE_PATH)
     if settings.argo.enabled and settings.argo.mode == "quick":
         url = quick_url_from_log(ARGO_LOG_PATH) or argo_state.get("quick_url", "")
@@ -348,9 +363,8 @@ def _status() -> int:
         "subscription": settings.subscription.as_dict(),
     }, ensure_ascii=False, indent=2, sort_keys=True))
     for name in ("sbox5.service", "sbox5-argo.service", "sbox5-ddns.timer", "sbox5-subscription.service", "sbox5-firewall.service"):
-        if (Path("/etc/systemd/system") / name).exists():
-            result = run(["systemctl", "is-active", name], check=False)
-            print(f"{name}: {result.stdout.strip() or result.returncode}")
+        if service_exists(name):
+            print(f"{name}: {service_state_text(name)}")
     if CERTIFICATES_STATE_PATH.is_file():
         print(tr("Certificates: ", "证书：") + json.dumps(load_json(CERTIFICATES_STATE_PATH), ensure_ascii=False, sort_keys=True))
     if FIREWALL_STATE_PATH.is_file():
@@ -436,6 +450,70 @@ def _ddns_update() -> int:
     return 0
 
 
+def _ddns_loop() -> int:
+    settings = load_settings()
+    if not settings.ddns.enabled:
+        raise ConfigError(tr("DDNS is not enabled", "DDNS 未启用"))
+    token = validate_token_text(DDNS_TOKEN_PATH.read_text(encoding="utf-8"), "Cloudflare Token")
+    client = CloudflareDDNS(settings.ddns, token)
+    while True:
+        try:
+            result = client.sync(DDNS_STATE_PATH)
+            for change in result["changes"]:
+                print(change, flush=True)
+            for warning in result["warnings"]:
+                print(tr("Warning: ", "警告：") + warning, flush=True)
+        except (SBox5Error, OSError, ValueError) as exc:
+            print(tr("DDNS loop error: ", "DDNS 循环错误：") + str(exc), file=sys.stderr, flush=True)
+        time.sleep(settings.ddns.interval_seconds)
+
+
+def _logs(args: argparse.Namespace) -> int:
+    require_linux_root()
+    names = {
+        "core": "sbox5.service",
+        "argo": "sbox5-argo.service",
+        "ddns": "sbox5-ddns.service",
+        "subscription": "sbox5-subscription.service",
+        "firewall": "sbox5-firewall.service",
+    }
+    name = names[args.service]
+    if not service_exists(name):
+        raise ConfigError(tr("The selected service is not installed", "所选服务未安装"))
+    subprocess.run(service_logs_command(name, follow=args.follow), check=False)
+    return 0
+
+
+def _doctor(args: argparse.Namespace) -> int:
+    require_linux_root()
+    settings, secrets = load_settings(), load_secrets()
+    data = doctor_data(settings, secrets)
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(render_checks(data["checks"]))
+        print(tr("Summary: ", "汇总：") + f"ok={data['counts']['ok']} warn={data['counts']['warn']} fail={data['counts']['fail']}")
+    return 0 if data["healthy"] else 1
+
+
+def _ip(args: argparse.Namespace) -> int:
+    require_linux_root()
+    settings, secrets = load_settings(), load_secrets()
+    if args.ip_command == "show":
+        print(json.dumps({
+            "output_family": settings.output_family,
+            "addresses": network_summary(),
+        }, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    settings.output_family = args.family
+    return _apply_reconfigure(args, settings, secrets, "ip")
+
+
+def _menu() -> int:
+    from .menu import run as menu_run
+    return menu_run()
+
+
 def _firewall_apply() -> int:
     require_linux_root()
     result = apply_firewall(load_settings(), FIREWALL_STATE_PATH)
@@ -511,7 +589,7 @@ def _argo(args: argparse.Namespace) -> int:
             if url:
                 state["quick_url"] = url
         unit = Path("/etc/systemd/system/sbox5-argo.service")
-        active = run(["systemctl", "is-active", "sbox5-argo.service"], check=False).stdout.strip() if unit.exists() else "not-installed"
+        active = service_state_text("sbox5-argo.service") if service_exists("sbox5-argo.service") else "not-installed"
         data = {"settings": settings.argo.as_dict(), "state": state, "service": active}
         print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) if args.json else json.dumps(data, ensure_ascii=False, sort_keys=True))
         return 0
@@ -536,7 +614,7 @@ def _argo(args: argparse.Namespace) -> int:
     if args.argo_command in ("start", "stop"):
         if not settings.argo.enabled:
             raise ConfigError(tr("Argo is not enabled", "Argo 未启用"))
-        run(["systemctl", args.argo_command, "sbox5-argo.service"], timeout=90)
+        service_start("sbox5-argo.service") if args.argo_command == "start" else service_stop("sbox5-argo.service")
         if args.argo_command == "start":
             require_active("sbox5-argo.service")
         print(tr("Argo service: ", "Argo 服务：") + args.argo_command)
@@ -549,13 +627,13 @@ def _argo(args: argparse.Namespace) -> int:
             if not token:
                 token = _prompt("", tr("New Argo Tunnel Token (input hidden)", "新的 Argo Tunnel Token（输入不可见）"), args, secret=True)
             return _apply_reconfigure(args, settings, secrets, "argo", argo_token=validate_token_text(token, "Argo Token"))
-        run(["systemctl", "stop", "sbox5-argo.service"], check=False)
+        service_stop("sbox5-argo.service")
         for path in (ARGO_LOG_PATH, ARGO_STATE_PATH):
             if path.is_symlink():
                 raise ConfigError(tr(f"Refusing to remove a symbolic link: {path}", f"拒绝删除符号链接：{path}"))
             if path.exists():
                 path.unlink()
-        run(["systemctl", "start", "sbox5-argo.service"], check=False)
+        service_start("sbox5-argo.service")
         require_active("sbox5-argo.service")
         url = wait_for_quick_url(ARGO_LOG_PATH, timeout=20)
         state = write_argo_state(ARGO_STATE_PATH, settings, url)
@@ -587,7 +665,7 @@ def _warp(args: argparse.Namespace) -> int:
     settings, secrets = load_settings(), load_secrets()
     if args.warp_command == "status":
         unit = Path("/etc/systemd/system/sbox5.service")
-        active = run(["systemctl", "is-active", "sbox5.service"], check=False).stdout.strip() if unit.exists() else "not-installed"
+        active = service_state_text("sbox5.service") if service_exists("sbox5.service") else "not-installed"
         data = {
             "settings": settings.warp.as_dict(),
             "credential": secrets.warp.public_state(),
@@ -877,7 +955,7 @@ def _subscription(args: argparse.Namespace) -> int:
     settings, secrets = load_settings(), load_secrets()
     if args.subscription_command == "status":
         unit = Path("/etc/systemd/system/sbox5-subscription.service")
-        active = run(["systemctl", "is-active", "sbox5-subscription.service"], check=False).stdout.strip() if unit.exists() else "not-installed"
+        active = service_state_text("sbox5-subscription.service") if service_exists("sbox5-subscription.service") else "not-installed"
         data = {
             "settings": settings.subscription.as_dict(),
             "config": subscription_status(SUBSCRIPTION_CONFIG_PATH),
@@ -914,9 +992,9 @@ def _subscription(args: argparse.Namespace) -> int:
         return _apply_reconfigure(args, settings, secrets, "subscription")
     if args.subscription_command in ("start", "stop"):
         unit = Path("/etc/systemd/system/sbox5-subscription.service")
-        if not unit.exists():
+        if not service_exists("sbox5-subscription.service"):
             raise ConfigError(tr("The subscription service is not installed", "订阅服务未安装"))
-        run(["systemctl", args.subscription_command, "sbox5-subscription.service"], timeout=90)
+        service_start("sbox5-subscription.service") if args.subscription_command == "start" else service_stop("sbox5-subscription.service")
         if args.subscription_command == "start":
             require_active("sbox5-subscription.service")
         return 0
@@ -980,13 +1058,26 @@ def build_parser() -> argparse.ArgumentParser:
     _add_install_arguments(install)
     upgrade = commands.add_parser("upgrade", parents=[language], help=tr("Upgrade from the current lock files", "按当前项目锁文件升级"))
     _add_install_arguments(upgrade)
-    commands.add_parser("status", parents=[language], help=tr("Show non-sensitive runtime status", "显示非敏感运行状态"))
+    status = commands.add_parser("status", parents=[language], help=tr("Show non-sensitive runtime status", "显示非敏感运行状态"))
+    status.add_argument("--geo", action="store_true", help=tr("Look up public IP geolocation over HTTPS", "通过 HTTPS 查询公网 IP 归属地"))
     show = commands.add_parser("show", parents=[language], help=tr("Show node credentials", "显示节点凭据"))
     show.add_argument("--protocol", choices=("vless", "vmess", "vmess-argo", "hysteria2", "tuic", "anytls"))
     show.add_argument("--json", action="store_true")
     show.add_argument("--qr", action="store_true")
     commands.add_parser("export", parents=[language], help=tr("Re-export local client files", "重新导出本地客户端文件"))
     commands.add_parser("check", parents=[language], help=tr("Validate server and client configurations", "检查服务端和客户端配置"))
+    logs = commands.add_parser("logs", parents=[language], help=tr("Show service logs", "查看服务日志"))
+    logs.add_argument("--service", choices=("core", "argo", "ddns", "subscription", "firewall"), default="core")
+    logs.add_argument("--follow", action="store_true")
+    doctor = commands.add_parser("doctor", parents=[language], help=tr("Run local health checks", "执行本地健康检查"))
+    doctor.add_argument("--json", action="store_true")
+    ip = commands.add_parser("ip", parents=[language], help=tr("Show or select the IPv4/IPv6 export address", "显示或选择 IPv4/IPv6 导出地址"))
+    ip_commands = ip.add_subparsers(dest="ip_command", required=True)
+    ip_commands.add_parser("show", parents=[language], help=tr("Show local global addresses", "显示本地全局地址"))
+    ip_set = ip_commands.add_parser("set", parents=[language], help=tr("Select the export address family", "选择导出地址族"))
+    ip_set.add_argument("--family", choices=("auto", "ipv4", "ipv6"), required=True)
+    ip_set.add_argument("--yes", action="store_true")
+    commands.add_parser("menu", parents=[language], help=tr("Open the interactive menu", "打开交互菜单"))
     port = commands.add_parser("port", parents=[language], help=tr("Change protocol ports or UDP hopping ranges", "修改协议端口或 UDP 跳跃范围"))
     port_commands = port.add_subparsers(dest="port_command", required=True)
     port_set = port_commands.add_parser("set", parents=[language], help=tr("Change one protocol port", "修改单个协议端口"))
@@ -1171,6 +1262,7 @@ def build_parser() -> argparse.ArgumentParser:
     subscription_rotate.add_argument("--yes", action="store_true")
     commands.add_parser("subscription-serve", parents=[language], help=argparse.SUPPRESS).add_argument("--non-interactive", action="store_true")
     commands.add_parser("ddns-update", parents=[language], help=argparse.SUPPRESS).add_argument("--non-interactive", action="store_true")
+    commands.add_parser("ddns-loop", parents=[language], help=argparse.SUPPRESS).add_argument("--non-interactive", action="store_true")
     commands.add_parser("firewall-apply", parents=[language], help=argparse.SUPPRESS).add_argument("--non-interactive", action="store_true")
     commands.add_parser("snapshots", parents=[language], help=tr("List transaction snapshots", "列出事务快照"))
     rollback = commands.add_parser("rollback", parents=[language], help=tr("Restore a snapshot with the standalone restorer", "使用独立恢复器恢复快照"))
@@ -1179,7 +1271,7 @@ def build_parser() -> argparse.ArgumentParser:
     uninstall = commands.add_parser("uninstall", parents=[language], help=tr("Remove project files and rules, keeping snapshots and packages", "移除项目文件和规则，保留快照与软件包"))
     uninstall.add_argument("--yes", action="store_true")
     uninstall.add_argument("--non-interactive", action="store_true")
-    hidden = {"ddns-update", "firewall-apply", "subscription-serve"}
+    hidden = {"ddns-update", "ddns-loop", "firewall-apply", "subscription-serve"}
     commands._choices_actions = [action for action in commands._choices_actions if action.dest not in hidden]
     return parser
 
@@ -1199,13 +1291,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.command in ("install", "upgrade"):
             return _install(args, args.command == "upgrade")
         if args.command == "status":
-            return _status()
+            return _status(args)
         if args.command == "show":
             return _show(args)
         if args.command == "export":
             return _export()
         if args.command == "check":
             return _check()
+        if args.command == "logs":
+            return _logs(args)
+        if args.command == "doctor":
+            return _doctor(args)
+        if args.command == "ip":
+            return _ip(args)
+        if args.command == "menu":
+            return _menu()
         if args.command == "port":
             return _port(args)
         if args.command == "protocol":
@@ -1228,6 +1328,8 @@ def main(argv: list[str] | None = None) -> int:
             return subscription_serve()
         if args.command == "ddns-update":
             return _ddns_update()
+        if args.command == "ddns-loop":
+            return _ddns_loop()
         if args.command == "firewall-apply":
             return _firewall_apply()
         if args.command == "snapshots":

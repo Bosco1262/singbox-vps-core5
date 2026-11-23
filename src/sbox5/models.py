@@ -688,6 +688,7 @@ class Settings:
     routing: RoutingSettings = field(default_factory=RoutingSettings)
     cdn: CdnSettings = field(default_factory=CdnSettings)
     subscription: SubscriptionSettings = field(default_factory=SubscriptionSettings)
+    output_family: str = "auto"
     schema_version: int = 2
     protocols: dict[str, ProtocolSettings] = field(default_factory=default_protocols)
     certificate_profiles: list[CertificateProfile] = field(default_factory=list)
@@ -880,6 +881,9 @@ class Settings:
         self.argo.validate()
         self.warp.validate()
         self.routing.validate(self.route_targets())
+        self.output_family = self.output_family.strip().lower() or "auto"
+        if self.output_family not in ("auto", "ipv4", "ipv6"):
+            raise ConfigError(tr("Output family must be auto, ipv4, or ipv6", "输出地址族必须是 auto、ipv4 或 ipv6"))
         if self.ddns.enabled and self.host != self.ddns.record:
             raise ConfigError(tr("When DDNS is enabled, the server address must be the DDNS record", "启用 DDNS 时，服务器地址必须使用 DDNS 记录"))
         if self.ddns.enabled and self.argo.enabled and self.argo.mode == "token" and self.ddns.record == self.argo.hostname:
@@ -965,6 +969,7 @@ class Settings:
             "routing": self.routing.as_dict(),
             "cdn": self.cdn.as_dict(),
             "subscription": self.subscription.as_dict(),
+            "output_family": self.output_family,
             "protocols": {name: protocol.as_dict() for name, protocol in self.protocols.items()},
             "certificate_profiles": [profile.as_dict() for profile in self.certificate_profiles],
         }
@@ -998,6 +1003,7 @@ class Settings:
             routing=RoutingSettings.from_dict(value.get("routing", {})),
             cdn=CdnSettings.from_dict(value.get("cdn", {})),
             subscription=SubscriptionSettings.from_dict(value.get("subscription", {})),
+            output_family=str(value.get("output_family", "auto")),
             schema_version=int(value.get("schema_version", 3)),
             protocols=protocols,
             certificate_profiles=profiles,

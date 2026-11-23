@@ -100,13 +100,14 @@ def _allowed_target(path: PurePosixPath) -> bool:
     return (
         path == PurePosixPath("/usr/local/bin/sbox5")
         or path == PurePosixPath("/etc/sysctl.d/99-sbox5.conf")
-        or any(root in path.parents for root in (PurePosixPath("/etc/sbox5"), PurePosixPath("/usr/local/libexec/sbox5"), PurePosixPath("/var/lib/sbox5")))
+        or any(root in path.parents for root in (PurePosixPath("/etc/sbox5"), PurePosixPath("/usr/local/libexec/sbox5"), PurePosixPath("/var/lib/sbox5"), PurePosixPath("/var/log/sbox5")))
         or (path.parent == PurePosixPath("/etc/systemd/system") and path.name.startswith("sbox5"))
+        or (path.parent == PurePosixPath("/etc/init.d") and path.name.startswith("sbox5"))
     )
 
 
 def _allowed_directory(path: PurePosixPath) -> bool:
-    return path in (PurePosixPath("/var/lib/sbox5-runtime"), PurePosixPath("/var/log/sbox5-acme")) or any(
+    return path in (PurePosixPath("/var/lib/sbox5-runtime"), PurePosixPath("/var/log/sbox5-acme"), PurePosixPath("/var/log/sbox5")) or any(
         root == path or root in path.parents
         for root in (PurePosixPath("/etc/sbox5"), PurePosixPath("/usr/local/libexec/sbox5"), PurePosixPath("/var/lib/sbox5"))
     )
@@ -408,8 +409,17 @@ def _service_backend(service: dict[str, Any]) -> str:
     return str(service.get("backend", "systemd"))
 
 
+def _service_name(service: dict[str, Any]) -> str:
+    name = str(service["name"])
+    if _service_backend(service) == "openrc":
+        for suffix in (".service", ".timer"):
+            if name.endswith(suffix):
+                return name[:-len(suffix)]
+    return name
+
+
 def _service_stop(service: dict[str, Any]) -> None:
-    name = service["name"]
+    name = _service_name(service)
     if _service_backend(service) == "openrc":
         run(["rc-service", name, "stop"], check=False)
     else:
@@ -417,7 +427,7 @@ def _service_stop(service: dict[str, Any]) -> None:
 
 
 def _service_disable(service: dict[str, Any]) -> None:
-    name = service["name"]
+    name = _service_name(service)
     if _service_backend(service) == "openrc":
         run(["rc-update", "del", name, "default"], check=False)
     else:
@@ -425,7 +435,7 @@ def _service_disable(service: dict[str, Any]) -> None:
 
 
 def _service_enable(service: dict[str, Any]) -> None:
-    name = service["name"]
+    name = _service_name(service)
     if _service_backend(service) == "openrc":
         run(["rc-update", "add", name, "default"], check=True)
     else:
@@ -433,7 +443,7 @@ def _service_enable(service: dict[str, Any]) -> None:
 
 
 def _service_start(service: dict[str, Any]) -> None:
-    name = service["name"]
+    name = _service_name(service)
     if _service_backend(service) == "openrc":
         run(["rc-service", name, "start"], check=True)
     else:
@@ -476,7 +486,7 @@ def restore(snapshot: Path, assume_yes: bool, automatic: bool) -> None:
                 grp.getgrgid(gid)
             except KeyError:
                 run(["groupadd", "--system", "--gid", str(gid), name], check=True)
-            run(["useradd", "--system", "--uid", str(uid), "--gid", str(gid), "--no-create-home", "--shell", "/usr/sbin/nologin", name], check=True)
+            run(["useradd", "--system", "--uid", str(uid), "--gid", str(gid), "--no-create-home", "--shell", "/sbin/nologin" if Path("/sbin/nologin").exists() else "/usr/sbin/nologin", name], check=True)
     for entry in sorted(manifest["files"], key=lambda item: len(PurePosixPath(item["path"]).parts), reverse=True):
         path = Path(entry["path"])
         if entry.get("existed"):
