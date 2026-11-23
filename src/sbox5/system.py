@@ -56,11 +56,18 @@ def preflight() -> None:
 def check_ports(settings: Settings) -> None:
     occupied: list[str] = []
     for protocol, port in settings.ports.as_dict().items():
+        if not settings.protocols[protocol].enabled:
+            continue
         transport = "udp" if protocol in ("hysteria2", "tuic") else "tcp"
         if not port_is_free(port, transport):
             occupied.append(f"{protocol} {port}/{transport}")
-    if settings.certificate_mode == "acme" and not port_is_free(80, "tcp"):
-        occupied.append("acme 80/tcp")
+    for profile in settings.active_certificate_profiles():
+        if profile.mode != "acme":
+            continue
+        if profile.challenge == "http-01" and not port_is_free(80, "tcp"):
+            occupied.append("acme-http-01 80/tcp")
+        elif profile.challenge == "tls-alpn-01" and not port_is_free(443, "tcp"):
+            occupied.append("acme-tls-alpn-01 443/tcp")
     if occupied:
         raise ConfigError(tr("The following ports are already in use: ", "以下端口已被占用：") + tr(", ", "、").join(occupied))
 
@@ -71,9 +78,7 @@ def _package_installed(name: str) -> bool:
 
 
 def ensure_packages(settings: Settings) -> dict[str, Any]:
-    packages = ["ca-certificates", "python3", "openssl", "nftables", "qrencode"]
-    if settings.certificate_mode == "acme":
-        packages.append("certbot")
+    packages = ["ca-certificates", "python3", "openssl", "nftables", "iptables", "qrencode"]
     missing = [name for name in packages if not _package_installed(name)]
     if missing:
         environment = dict(os.environ)

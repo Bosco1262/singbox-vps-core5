@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from sbox5.config import build_server_config
 from sbox5.errors import ConfigError
 from sbox5.export import build_mihomo, build_share_links, build_singbox_client, export_nodes, yaml_dump
-from sbox5.models import ArgoSettings, DDNSSettings, Secrets, Settings
+from sbox5.models import ArgoSettings, CertificateProfile, DDNSSettings, Ports, ProtocolSettings, Secrets, Settings
 from sbox5.util import format_host_port, normalize_host, split_host_port
 
 
@@ -72,11 +72,16 @@ class ModelTests(unittest.TestCase):
                 argo=ArgoSettings(enabled=True, hostname="vpn.example.com"),
             )
 
-    def test_only_hysteria2_port_hopping_is_accepted(self):
+    def test_port_hopping_supports_hysteria2_and_tuic(self):
         with self.assertRaises(ConfigError):
-            settings(port_hopping={"tuic": "20000:21000"})
-        configured = settings(port_hopping={"hysteria2": "20000:21000"})
+            settings(port_hopping={"vmess": "20000:21000"})
+        configured = settings(port_hopping={"hysteria2": "20000:21000", "tuic": "21001:22000"})
         self.assertEqual(configured.port_hopping["hysteria2"], "20000:21000")
+        self.assertEqual(configured.port_hopping["tuic"], "21001:22000")
+        with self.assertRaises(ConfigError):
+            settings(port_hopping={"hysteria2": "20000:21000", "tuic": "20500:21500"})
+        with self.assertRaises(ConfigError):
+            settings(port_hopping={"tuic": "18445:21000"})
 
 
 class ConfigTests(unittest.TestCase):
@@ -113,6 +118,85 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(argo["tls"]["server_name"], "argo.example.com")
         self.assertNotIn("insecure", argo["tls"])
 
+    def test_route_rules_start_with_sniff(self):
+        document = build_server_config(settings(), secrets())
+        self.assertEqual(document["route"]["rules"][0], {"action": "sniff"})
+
+    def test_native_acme_provider_is_generated(self):
+        configured = settings(certificate_mode="acme", domain="vpn.example.com")
+        document = build_server_config(configured, secrets())
+        providers = document["certificate_providers"]
+        self.assertEqual(len(providers), 1)
+        self.assertEqual(providers[0]["type"], "acme")
+        self.assertEqual(providers[0]["tag"], "default")
+        self.assertEqual(providers[0]["domain"], ["vpn.example.com"])
+        inbounds = {item["type"]: item for item in document["inbounds"]}
+        self.assertEqual(inbounds["hysteria2"]["tls"]["certificate_provider"], "default")
+        self.assertNotIn("certificate_path", inbounds["hysteria2"]["tls"])
+
+    def test_disabled_protocol_is_omitted_from_server_config(self):
+        configured = settings()
+        configured.protocols["vmess"].enabled = False
+        configured.validate()
+        document = build_server_config(configured, secrets())
+        self.assertNotIn("vmess", {item["type"] for item in document["inbounds"]})
+        self.assertNotIn("vmess", build_share_links(configured, secrets(), certificate(), {"default": certificate()}))
+
+    def test_vmess_tls_conflicts_with_argo(self):
+        with self.assertRaises(ConfigError):
+            settings(
+                argo=ArgoSettings(enabled=True, hostname="argo.example.com"),
+                protocols={
+                    "vless": ProtocolSettings(True, ""),
+                    "vmess": ProtocolSettings(True, "default"),
+                },
+            )
+
+    def test_v1_settings_migrate_to_v2(self):
+        configured = settings()
+        self.assertEqual(configured.schema_version, 2)
+        self.assertEqual([profile.id for profile in configured.certificate_profiles], ["default"])
+        self.assertEqual(configured.protocols["vmess"].tls_profile, "")
+        restored = Settings.from_dict(configured.as_dict())
+        self.assertEqual(restored.as_dict(), configured.as_dict())
+
+    def test_all_protocols_disabled_is_rejected(self):
+        configured = settings()
+        for protocol in configured.protocols.values():
+            protocol.enabled = False
+        with self.assertRaises(ConfigError):
+            configured.validate()
+
+    def test_acme_dns01_token_is_embedded(self):
+        configured = settings(certificate_mode="acme", domain="vpn.example.com")
+        configured.certificate_profiles[0].challenge = "dns-01"
+        configured.validate()
+        secret = secrets()
+        secret.acme_dns_tokens["default"] = "dns-api-token"
+        document = build_server_config(configured, secret)
+        provider = document["certificate_providers"][0]
+        self.assertEqual(provider["dns01_challenge"]["provider"], "cloudflare")
+        self.assertEqual(provider["dns01_challenge"]["api_token"], "dns-api-token")
+
+    def test_acme_dns01_requires_token(self):
+        configured = settings(certificate_mode="acme", domain="vpn.example.com")
+        configured.certificate_profiles[0].challenge = "dns-01"
+        configured.validate()
+        with self.assertRaises(ConfigError):
+            build_server_config(configured, secrets())
+
+    def test_acme_challenge_port_conflict_is_rejected(self):
+        with self.assertRaises(ConfigError):
+            settings(certificate_mode="acme", domain="vpn.example.com", ports=Ports(vless=80))
+
+    def test_duplicate_certificate_profile_ids_are_rejected(self):
+        configured = settings()
+        configured.certificate_profiles.append(
+            CertificateProfile.from_dict(configured.certificate_profiles[0].as_dict())
+        )
+        with self.assertRaises(ConfigError):
+            configured.validate()
+
 
 class ExportTests(unittest.TestCase):
     def test_links_never_disable_tls_verification(self):
@@ -133,6 +217,12 @@ class ExportTests(unittest.TestCase):
         self.assertNotIn('"skip-cert-verify": true', rendered)
         self.assertIn(certificate()["certificate_fingerprint"], rendered)
         self.assertIn('"type": "anytls"', rendered)
+
+    def test_hysteria2_port_hopping_uses_uri_port_component(self):
+        configured = settings(port_hopping={"hysteria2": "20000:21000"})
+        link = build_share_links(configured, secrets(), certificate(), {"default": certificate()})["hysteria2"]
+        self.assertIn(":18444,20000-21000", urlsplit(link).netloc)
+        self.assertNotIn("mport=", link)
 
     def test_export_contains_no_private_key(self):
         configured, secret = settings(), secrets()

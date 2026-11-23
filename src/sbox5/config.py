@@ -9,15 +9,81 @@ from typing import Any
 
 from .errors import ConfigError
 from .i18n import tr
-from .models import Secrets, Settings
+from .models import CertificateProfile, Secrets, Settings
 from .util import run, split_host_port
 
 CERTIFICATE_PATH = Path("/etc/sbox5/tls/cert.pem")
 KEY_PATH = Path("/etc/sbox5/tls/key.pem")
+TLS_DIR = Path("/etc/sbox5/tls")
+ACME_STATE_DIR = Path("/var/lib/sbox5/acme")
 
 
-def _tls() -> dict[str, Any]:
-    return {"enabled": True, "certificate_path": str(CERTIFICATE_PATH), "key_path": str(KEY_PATH)}
+def certificate_profile(settings: Settings, profile_id: str) -> CertificateProfile:
+    for profile in settings.certificate_profiles:
+        if profile.id == profile_id:
+            return profile
+    raise ConfigError(tr(f"Certificate profile not found: {profile_id}", f"证书配置不存在：{profile_id}"))
+
+
+def profile_certificate_path(profile: CertificateProfile) -> Path:
+    if profile.id == "default":
+        return CERTIFICATE_PATH
+    return TLS_DIR / profile.id / "cert.pem"
+
+
+def profile_key_path(profile: CertificateProfile) -> Path:
+    if profile.id == "default":
+        return KEY_PATH
+    return TLS_DIR / profile.id / "key.pem"
+
+
+def profile_acme_data_directory(profile: CertificateProfile) -> Path:
+    return ACME_STATE_DIR / profile.id
+
+
+def _tls(profile: CertificateProfile) -> dict[str, Any]:
+    if profile.mode == "acme":
+        return {
+            "enabled": True,
+            "server_name": profile.server_name,
+            "certificate_provider": profile.id,
+        }
+    return {
+        "enabled": True,
+        "server_name": profile.server_name,
+        "certificate_path": str(profile_certificate_path(profile)),
+        "key_path": str(profile_key_path(profile)),
+    }
+
+
+def _acme_provider(profile: CertificateProfile, secrets: Secrets) -> dict[str, Any]:
+    provider: dict[str, Any] = {
+        "type": "acme",
+        "tag": profile.id,
+        "domain": list(profile.domains),
+        "provider": profile.ca_provider,
+        "data_directory": str(profile_acme_data_directory(profile)),
+        "key_type": "p256",
+    }
+    if profile.email:
+        provider["email"] = profile.email
+    if profile.acme_profile:
+        provider["profile"] = profile.acme_profile
+    if profile.challenge == "http-01":
+        provider["disable_tls_alpn_challenge"] = True
+    elif profile.challenge == "tls-alpn-01":
+        provider["disable_http_challenge"] = True
+    else:
+        token = secrets.acme_dns_tokens.get(profile.id, "")
+        if not token:
+            raise ConfigError(tr(
+                f"ACME DNS-01 requires a DNS API token for profile {profile.id}",
+                f"ACME DNS-01 需要为证书配置 {profile.id} 提供 DNS API Token",
+            ))
+        provider["disable_http_challenge"] = True
+        provider["disable_tls_alpn_challenge"] = True
+        provider["dns01_challenge"] = {"provider": profile.dns_provider, "api_token": token}
+    return provider
 
 
 def build_server_config(settings: Settings, secrets: Secrets) -> dict[str, Any]:
@@ -26,68 +92,92 @@ def build_server_config(settings: Settings, secrets: Secrets) -> dict[str, Any]:
     if not secrets.reality_private_key or not secrets.reality_public_key:
         raise ConfigError(tr("The Reality key pair has not been generated yet", "尚未生成 Reality 密钥"))
     target, target_port = split_host_port(settings.reality_target)
-    return {
-        "log": {"level": "warn", "timestamp": True},
-        "inbounds": [
-            {
-                "type": "vless",
-                "tag": "vless-reality",
-                "listen": "::",
-                "listen_port": settings.ports.vless,
-                "users": [{"name": "vless", "uuid": secrets.vless_uuid, "flow": "xtls-rprx-vision"}],
-                "tls": {
+    inbounds: list[dict[str, Any]] = []
+    profiles = {profile.id: profile for profile in settings.certificate_profiles}
+
+    if settings.protocols["vless"].enabled:
+        inbounds.append({
+            "type": "vless",
+            "tag": "vless-reality",
+            "listen": "::",
+            "listen_port": settings.ports.vless,
+            "users": [{"name": "vless", "uuid": secrets.vless_uuid, "flow": "xtls-rprx-vision"}],
+            "tls": {
+                "enabled": True,
+                "server_name": settings.reality_sni,
+                "reality": {
                     "enabled": True,
-                    "server_name": settings.reality_sni,
-                    "reality": {
-                        "enabled": True,
-                        "handshake": {"server": target, "server_port": target_port},
-                        "private_key": secrets.reality_private_key,
-                        "short_id": [secrets.reality_short_id],
-                        "max_time_difference": "1m",
-                    },
+                    "handshake": {"server": target, "server_port": target_port},
+                    "private_key": secrets.reality_private_key,
+                    "short_id": [secrets.reality_short_id],
+                    "max_time_difference": "1m",
                 },
             },
-            {
-                "type": "vmess",
-                "tag": "vmess-ws",
-                "listen": "::",
-                "listen_port": settings.ports.vmess,
-                "users": [{"name": "vmess", "uuid": secrets.vmess_uuid, "alter_id": 0}],
-                "transport": {"type": "ws", "path": secrets.vmess_path, "max_early_data": 0},
-            },
-            {
-                "type": "hysteria2",
-                "tag": "hysteria2",
-                "listen": "::",
-                "listen_port": settings.ports.hysteria2,
-                "users": [{"name": "hysteria2", "password": secrets.hysteria2_password}],
-                "obfs": {"type": "salamander", "password": secrets.hysteria2_obfs_password},
-                "tls": _tls(),
-            },
-            {
-                "type": "tuic",
-                "tag": "tuic-v5",
-                "listen": "::",
-                "listen_port": settings.ports.tuic,
-                "users": [{"name": "tuic", "uuid": secrets.tuic_uuid, "password": secrets.tuic_password}],
-                "congestion_control": "bbr",
-                "auth_timeout": "3s",
-                "zero_rtt_handshake": False,
-                "heartbeat": "10s",
-                "tls": _tls(),
-            },
-            {
-                "type": "anytls",
-                "tag": "anytls",
-                "listen": "::",
-                "listen_port": settings.ports.anytls,
-                "users": [{"name": "anytls", "password": secrets.anytls_password}],
-                "tls": _tls(),
-            },
-        ],
+        })
+    if settings.protocols["vmess"].enabled:
+        vmess: dict[str, Any] = {
+            "type": "vmess",
+            "tag": "vmess-ws",
+            "listen": "::",
+            "listen_port": settings.ports.vmess,
+            "users": [{"name": "vmess", "uuid": secrets.vmess_uuid, "alter_id": 0}],
+            "transport": {"type": "ws", "path": secrets.vmess_path, "max_early_data": 0},
+        }
+        profile_id = settings.protocols["vmess"].tls_profile
+        if profile_id:
+            vmess["tls"] = _tls(profiles[profile_id])
+        inbounds.append(vmess)
+    if settings.protocols["hysteria2"].enabled:
+        inbounds.append({
+            "type": "hysteria2",
+            "tag": "hysteria2",
+            "listen": "::",
+            "listen_port": settings.ports.hysteria2,
+            "users": [{"name": "hysteria2", "password": secrets.hysteria2_password}],
+            "obfs": {"type": "salamander", "password": secrets.hysteria2_obfs_password},
+            "tls": _tls(profiles[settings.protocols["hysteria2"].tls_profile]),
+        })
+    if settings.protocols["tuic"].enabled:
+        inbounds.append({
+            "type": "tuic",
+            "tag": "tuic-v5",
+            "listen": "::",
+            "listen_port": settings.ports.tuic,
+            "users": [{"name": "tuic", "uuid": secrets.tuic_uuid, "password": secrets.tuic_password}],
+            "congestion_control": "bbr",
+            "auth_timeout": "3s",
+            "zero_rtt_handshake": False,
+            "heartbeat": "10s",
+            "tls": _tls(profiles[settings.protocols["tuic"].tls_profile]),
+        })
+    if settings.protocols["anytls"].enabled:
+        inbounds.append({
+            "type": "anytls",
+            "tag": "anytls",
+            "listen": "::",
+            "listen_port": settings.ports.anytls,
+            "users": [{"name": "anytls", "password": secrets.anytls_password}],
+            "tls": _tls(profiles[settings.protocols["anytls"].tls_profile]),
+        })
+
+    providers = [
+        _acme_provider(profile, secrets)
+        for profile in settings.active_certificate_profiles()
+        if profile.mode == "acme"
+    ]
+    config: dict[str, Any] = {
+        "log": {"level": "warn", "timestamp": True},
+        "inbounds": inbounds,
         "outbounds": [{"type": "direct", "tag": "direct"}],
-        "route": {"rules": [], "final": "direct", "auto_detect_interface": True},
+        "route": {
+            "rules": [{"action": "sniff"}],
+            "final": "direct",
+            "auto_detect_interface": True,
+        },
     }
+    if providers:
+        config["certificate_providers"] = providers
+    return config
 
 
 def generate_reality_keypair(binary: Path, secrets: Secrets) -> None:

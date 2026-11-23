@@ -39,7 +39,10 @@ def _service_state(name: str) -> dict[str, Any]:
         Path("/usr/lib/systemd/system") / name,
         Path("/lib/systemd/system") / name,
     ))
-    return {"name": name, "existed": existed, "was_active": active, "was_enabled": enabled, "was_masked": masked}
+    return {
+        "name": name, "backend": "systemd", "existed": existed,
+        "was_active": active, "was_enabled": enabled, "was_masked": masked,
+    }
 
 
 class Snapshot:
@@ -57,6 +60,7 @@ class Snapshot:
         directories: Iterable[Path],
         services: Iterable[str],
         packages: dict[str, Any] | None = None,
+        feature: str = "install",
     ) -> "Snapshot":
         created_at = datetime.now(timezone.utc)
         snapshot_id = created_at.strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(4)
@@ -68,8 +72,9 @@ class Snapshot:
         payload = path / "payload"
         payload.mkdir(mode=0o700)
         manifest: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "snapshot_id": snapshot_id,
+            "feature": feature,
             "created_at": created_at.isoformat().replace("+00:00", "Z"),
             "project_version": __version__,
             "state": "prepared",
@@ -78,12 +83,14 @@ class Snapshot:
             "services": [],
             "firewall": {"snapshots": [], "owned": []},
             "cron": {"snapshot": "", "owned_blocks": []},
+            "schedulers": [],
+            "certificates": [],
             "packages": packages or {"installed_by_project": [], "upgraded_by_project": [], "removal_policy": "keep"},
             "sysctls": [],
             "users_created": [],
             "operations": [],
             "external_resources": [],
-            "recovery": {"entrypoint": "restore.py", "python_minimum": "3.10", "network_required": False},
+            "recovery": {"entrypoint": "restore.py", "python_minimum": "3.10", "min_restore_version": 2, "network_required": False},
         }
         for index, file_path in enumerate(dict.fromkeys(files)):
             file_path = file_path.absolute()

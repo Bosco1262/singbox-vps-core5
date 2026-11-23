@@ -46,7 +46,10 @@ def uninstall(args: argparse.Namespace) -> int:
         raise ConfigError(tr("Use --yes to confirm the uninstall", "请使用 --yes 确认卸载"))
     settings = load_settings()
     state = load_json(STATE_PATH)
-    snapshot = Snapshot.create(SNAPSHOT_ROOT, Path(args.project_root), managed_files(), _managed_directories(), UNITS)
+    snapshot = Snapshot.create(
+        SNAPSHOT_ROOT, Path(args.project_root), managed_files(settings), _managed_directories(settings), UNITS,
+        feature="uninstall",
+    )
     snapshot.record_nft_owned("before")
     if FIREWALL_STATE_PATH.is_file():
         for resource in load_json(FIREWALL_STATE_PATH).get("owned", []):
@@ -108,10 +111,10 @@ def uninstall(args: argparse.Namespace) -> int:
             else:
                 run(["groupdel", name["name"]], check=False)
         preserved = {
-            SNAPSHOT_ROOT, Path("/var/lib/sbox5"), Path("/etc/sbox5/acme"),
-            Path("/var/lib/sbox5/acme"), Path("/var/log/sbox5-acme"),
+            SNAPSHOT_ROOT, Path("/var/lib/sbox5"), Path("/var/lib/sbox5/acme"),
+            Path("/etc/sbox5/acme"), Path("/var/log/sbox5-acme"),
         }
-        for item in sorted(_managed_directories(), key=lambda path: len(path.parts), reverse=True):
+        for item in sorted(_managed_directories(settings), key=lambda path: len(path.parts), reverse=True):
             if item in preserved or any(parent in preserved for parent in item.parents):
                 continue
             if item.is_dir() and not item.is_symlink():
@@ -126,7 +129,7 @@ def uninstall(args: argparse.Namespace) -> int:
         except Exception as rollback_error:
             raise ConflictError(f"{exc}\n{rollback_error}") from exc
         raise ConflictError(tr(f"Uninstall failed and was restored automatically. Snapshot: {snapshot.path}. Reason: {exc}", f"卸载失败，已自动恢复。快照：{snapshot.path}。原因：{exc}")) from exc
-    prune_snapshots(SNAPSHOT_ROOT, keep=3)
+    prune_snapshots(SNAPSHOT_ROOT, keep=5)
     print(tr("Uninstall completed. Standalone restore snapshot: ", "卸载完成。独立恢复快照：") + str(snapshot.path))
-    print(tr("APT packages, the ACME account store, logs, and remote Cloudflare resources have not been deleted.", "APT 软件包、ACME 账户库、日志和远端 Cloudflare 资源均未删除。"))
+    print(tr("APT packages, the native ACME account store, and remote Cloudflare resources have not been deleted.", "APT 软件包、原生 ACME 账户库和远端 Cloudflare 资源均未删除。"))
     return 0

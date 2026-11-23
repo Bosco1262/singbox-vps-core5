@@ -151,6 +151,21 @@ def validate_manifest(manifest: dict[str, Any], verified: set[str]) -> None:
     for service in manifest.get("services", []):
         if not re.fullmatch(r"sbox5[a-z0-9_.-]*", str(service.get("name", ""))):
             fail(tr("The snapshot contains a non-project service", "快照包含非项目服务"))
+        if service.get("backend", "systemd") not in ("systemd", "openrc"):
+            fail(tr("The snapshot contains an unsupported init backend", "快照包含不支持的 init 后端"))
+    for item in manifest.get("certificates", []):
+        if not isinstance(item, dict):
+            fail(tr("Invalid certificate profile record in the snapshot", "快照中的证书配置记录无效"))
+        profile_id = item.get("id", item.get("profile", ""))
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", str(profile_id)):
+            fail(tr("The snapshot contains an invalid certificate profile ID", "快照包含无效的证书配置 ID"))
+        if item.get("mode") not in ("self-signed", "acme", "imported"):
+            fail(tr("The snapshot contains an invalid certificate profile mode", "快照包含无效的证书配置模式"))
+    for item in manifest.get("schedulers", []):
+        if item.get("kind") not in ("systemd-timer", "openrc-cron"):
+            fail(tr("The snapshot contains an invalid scheduler", "快照包含无效的调度器"))
+        if not re.fullmatch(r"sbox5[a-z0-9_.-]*", str(item.get("name", ""))):
+            fail(tr("The snapshot contains a non-project scheduler", "快照包含非项目调度器"))
     for record in manifest.get("users_removed", []):
         if record.get("name") not in ("sbox5", "sbox5-ddns", "sbox5-argo"):
             fail(tr("The snapshot contains a non-project user", "快照包含非项目用户"))
@@ -174,12 +189,29 @@ def validate_manifest(manifest: dict[str, Any], verified: set[str]) -> None:
             for key in ("before", "after"):
                 if item.get(key) and str(item[key]) not in verified:
                     fail(tr(f"The firewall backup is not covered by SHA256SUMS: {item[key]}", f"防火墙备份未纳入 SHA256SUMS：{item[key]}"))
-        elif kind == "iptables-rule":
+        elif kind == "iptables-chain":
+            if (
+                not isinstance(item.get("ipv6"), bool)
+                or item.get("table") not in ("filter", "nat")
+                or item.get("chain") not in ("SBOX5-INPUT", "SBOX5-PREROUTING")
+            ):
+                fail(tr("Invalid iptables chain in the snapshot", "快照中的 iptables 链无效"))
+        elif kind == "iptables-jump":
             spec = item.get("spec")
             if (
                 not isinstance(item.get("ipv6"), bool)
                 or item.get("table") not in ("filter", "nat")
                 or item.get("chain") not in ("INPUT", "PREROUTING")
+                or item.get("target") not in ("SBOX5-INPUT", "SBOX5-PREROUTING")
+                or not isinstance(spec, list) or not spec or not all(isinstance(part, str) and part and "\x00" not in part for part in spec)
+            ):
+                fail(tr("Invalid iptables jump in the snapshot", "快照中的 iptables 跳转无效"))
+        elif kind == "iptables-rule":
+            spec = item.get("spec")
+            if (
+                not isinstance(item.get("ipv6"), bool)
+                or item.get("table") not in ("filter", "nat")
+                or item.get("chain") not in ("INPUT", "PREROUTING", "SBOX5-INPUT", "SBOX5-PREROUTING")
                 or not isinstance(spec, list) or not spec or not all(isinstance(part, str) and part and "\x00" not in part for part in spec)
             ):
                 fail(tr("Invalid iptables rule in the snapshot", "快照中的 iptables 规则无效"))
@@ -213,7 +245,7 @@ def verify_snapshot(snapshot: Path) -> dict[str, Any]:
     if "manifest.json" not in verified or "restore.py" not in verified:
         fail(tr("The snapshot verification manifest is incomplete", "快照校验清单不完整"))
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("schema_version") != 1:
+    if manifest.get("schema_version") not in (1, 2):
         fail(tr("Unsupported snapshot format", "不支持的快照格式"))
     validate_manifest(manifest, verified)
     return manifest
@@ -308,45 +340,104 @@ def find_conflicts(manifest: dict[str, Any], snapshot: Path, structural_only: bo
 
 def remove_firewall(manifest: dict[str, Any], snapshot: Path) -> list[str]:
     messages: list[str] = []
-    for item in manifest.get("firewall", {}).get("owned", []):
+    owned = manifest.get("firewall", {}).get("owned", [])
+    for item in owned:
         kind = item.get("kind")
-        if kind == "nft-table" and re.fullmatch(r"sbox5[a-z0-9_]*", item.get("name", "")):
-            name = item["name"]
-            if run(["nft", "list", "table", "inet", name]).returncode == 0:
-                run(["nft", "delete", "table", "inet", name], check=True)
-                messages.append(tr(f"Deleted nftables table {name}", f"已删除 nftables table {name}"))
-            if item.get("before"):
-                run(["nft", "-f", str(snapshot / relative(item["before"]))], check=True)
-                messages.append(tr(f"Restored nftables table {name}", f"已恢复 nftables table {name}"))
-        elif kind == "iptables-rule":
+        if kind != "nft-table" or not re.fullmatch(r"sbox5[a-z0-9_]*", item.get("name", "")):
+            continue
+        name = item["name"]
+        if run(["nft", "list", "table", "inet", name]).returncode == 0:
+            run(["nft", "delete", "table", "inet", name], check=True)
+            messages.append(tr(f"Deleted nftables table {name}", f"已删除 nftables table {name}"))
+        if item.get("before"):
+            run(["nft", "-f", str(snapshot / relative(item["before"]))], check=True)
+            messages.append(tr(f"Restored nftables table {name}", f"已恢复 nftables table {name}"))
+
+    delete_order = {"iptables-rule": 0, "iptables-jump": 1, "ufw-rule": 2, "iptables-chain": 3}
+    for item in sorted(
+        [entry for entry in owned if entry.get("kind") != "nft-table" and entry.get("action", "add") == "add"],
+        key=lambda entry: delete_order.get(str(entry.get("kind")), 9),
+    ):
+        kind = item.get("kind")
+        if kind in ("iptables-rule", "iptables-jump"):
             executable = "ip6tables" if item.get("ipv6") else "iptables"
-            table = item.get("table")
-            chain = item.get("chain")
-            spec = item.get("spec")
-            action = item.get("action", "add")
-            if action not in ("add", "remove") or table not in ("filter", "nat") or chain not in ("INPUT", "PREROUTING") or not isinstance(spec, list):
-                fail(tr("Invalid firewall rule in the snapshot", "快照中的防火墙规则无效"))
-            if action == "remove":
-                if run([executable, "-t", table, "-C", chain, *spec]).returncode != 0:
-                    run([executable, "-t", table, "-I", chain, "1", *spec], check=True)
-                    messages.append(tr(f"Restored {executable} project rules", f"已恢复 {executable} 项目规则"))
-            elif run([executable, "-t", table, "-D", chain, *spec]).returncode == 0:
-                messages.append(tr(f"Deleted {executable} project rules", f"已删除 {executable} 项目规则"))
+            table, chain, spec = item["table"], item["chain"], item["spec"]
+            if run([executable, "-t", table, "-D", chain, *spec], check=False).returncode == 0:
+                messages.append(tr(f"Deleted {executable} project rule from {chain}", f"已删除 {executable} 项目规则：{chain}"))
+        elif kind == "iptables-chain":
+            executable = "ip6tables" if item.get("ipv6") else "iptables"
+            table, chain = item["table"], item["chain"]
+            if run([executable, "-t", table, "-S", chain], check=False).returncode == 0:
+                run([executable, "-t", table, "-F", chain], check=False)
+                if run([executable, "-t", table, "-X", chain], check=False).returncode == 0:
+                    messages.append(tr(f"Deleted {executable} chain {chain}", f"已删除 {executable} 链 {chain}"))
         elif kind == "ufw-rule":
-            port = int(item["port"])
-            protocol = item["protocol"]
-            action = item.get("action", "add")
-            if action not in ("add", "remove") or not 1 <= port <= 65535 or protocol not in ("tcp", "udp"):
-                fail(tr("Invalid UFW rule in the snapshot", "快照中的 UFW 规则无效"))
-            if action == "remove":
-                name = item.get("name", "restored")
-                if not re.fullmatch(r"[a-z0-9-]+", name):
-                    fail(tr("Invalid UFW rule name in the snapshot", "快照中的 UFW 规则名称无效"))
-                run(["ufw", "allow", f"{port}/{protocol}", "comment", f"sbox5-{name}"], check=True)
-                messages.append(tr(f"Restored UFW {port}/{protocol}", f"已恢复 UFW {port}/{protocol}"))
-            elif run(["ufw", "--force", "delete", "allow", f"{port}/{protocol}"]).returncode == 0:
+            port, protocol = int(item["port"]), item["protocol"]
+            if run(["ufw", "--force", "delete", "allow", f"{port}/{protocol}"], check=False).returncode == 0:
                 messages.append(tr(f"Deleted UFW {port}/{protocol}", f"已删除 UFW {port}/{protocol}"))
+
+    restore_order = {"iptables-chain": 0, "iptables-jump": 1, "iptables-rule": 2, "ufw-rule": 3}
+    for item in sorted(
+        [entry for entry in owned if entry.get("kind") != "nft-table" and entry.get("action") == "remove"],
+        key=lambda entry: restore_order.get(str(entry.get("kind")), 9),
+    ):
+        kind = item.get("kind")
+        if kind == "iptables-chain":
+            executable = "ip6tables" if item.get("ipv6") else "iptables"
+            table, chain = item["table"], item["chain"]
+            if run([executable, "-t", table, "-S", chain], check=False).returncode != 0:
+                run([executable, "-t", table, "-N", chain], check=True)
+                messages.append(tr(f"Restored {executable} chain {chain}", f"已恢复 {executable} 链 {chain}"))
+        elif kind in ("iptables-rule", "iptables-jump"):
+            executable = "ip6tables" if item.get("ipv6") else "iptables"
+            table, chain, spec = item["table"], item["chain"], item["spec"]
+            if run([executable, "-t", table, "-C", chain, *spec], check=False).returncode != 0:
+                run([executable, "-t", table, "-I", chain, "1", *spec], check=True)
+                messages.append(tr(f"Restored {executable} project rule in {chain}", f"已恢复 {executable} 项目规则：{chain}"))
+        elif kind == "ufw-rule":
+            port, protocol = int(item["port"]), item["protocol"]
+            name = item.get("name", "restored")
+            if not re.fullmatch(r"[a-z0-9-]+", name):
+                fail(tr("Invalid UFW rule name in the snapshot", "快照中的 UFW 规则名称无效"))
+            run(["ufw", "allow", f"{port}/{protocol}", "comment", f"sbox5-{name}"], check=True)
+            messages.append(tr(f"Restored UFW {port}/{protocol}", f"已恢复 UFW {port}/{protocol}"))
     return messages
+
+
+def _service_backend(service: dict[str, Any]) -> str:
+    return str(service.get("backend", "systemd"))
+
+
+def _service_stop(service: dict[str, Any]) -> None:
+    name = service["name"]
+    if _service_backend(service) == "openrc":
+        run(["rc-service", name, "stop"], check=False)
+    else:
+        run(["systemctl", "stop", name], check=False)
+
+
+def _service_disable(service: dict[str, Any]) -> None:
+    name = service["name"]
+    if _service_backend(service) == "openrc":
+        run(["rc-update", "del", name, "default"], check=False)
+    else:
+        run(["systemctl", "disable", name], check=False)
+
+
+def _service_enable(service: dict[str, Any]) -> None:
+    name = service["name"]
+    if _service_backend(service) == "openrc":
+        run(["rc-update", "add", name, "default"], check=True)
+    else:
+        run(["systemctl", "enable", name], check=True)
+
+
+def _service_start(service: dict[str, Any]) -> None:
+    name = service["name"]
+    if _service_backend(service) == "openrc":
+        run(["rc-service", name, "start"], check=True)
+    else:
+        run(["systemctl", "start", name], check=True)
 
 
 def restore(snapshot: Path, assume_yes: bool, automatic: bool) -> None:
@@ -367,10 +458,10 @@ def restore(snapshot: Path, assume_yes: bool, automatic: bool) -> None:
     current_backup = save_current(manifest, snapshot)
     services = manifest.get("services", [])
     for service in services:
-        run(["systemctl", "stop", service["name"]], check=False)
+        _service_stop(service)
     for service in services:
         if not service.get("existed"):
-            run(["systemctl", "disable", service["name"]], check=False)
+            _service_disable(service)
     for record in manifest.get("users_removed", []):
         import grp
         import pwd
@@ -398,16 +489,17 @@ def restore(snapshot: Path, assume_yes: bool, automatic: bool) -> None:
     firewall_messages = remove_firewall(manifest, snapshot)
     for record in manifest.get("sysctls", []):
         run(["sysctl", "-w", f"{record['key']}={record['before']}"], check=True)
-    run(["systemctl", "daemon-reload"])
+    if any(_service_backend(service) == "systemd" for service in services):
+        run(["systemctl", "daemon-reload"])
     for service in services:
         name = service["name"]
         if service.get("existed"):
             if service.get("was_enabled"):
-                run(["systemctl", "enable", name], check=True)
+                _service_enable(service)
             else:
-                run(["systemctl", "disable", name])
+                _service_disable(service)
             if service.get("was_active"):
-                run(["systemctl", "start", name], check=True)
+                _service_start(service)
     for directory in sorted(manifest.get("directories", []), key=lambda item: len(PurePosixPath(item["path"]).parts), reverse=True):
         path = Path(directory["path"])
         if directory.get("existed") or not path.is_dir() or path.is_symlink():

@@ -161,6 +161,8 @@ def port_is_free(port: int, protocol: str) -> bool:
     except OSError:
         sock = socket.socket(socket.AF_INET, sock_type)
     with sock:
+        if protocol == "tcp":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         address = "::" if sock.family == socket.AF_INET6 else "0.0.0.0"
         try:
             sock.bind((address, port))

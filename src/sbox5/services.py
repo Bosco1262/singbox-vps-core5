@@ -35,7 +35,13 @@ def identity(name: str) -> tuple[int, int]:
 
 
 def singbox_unit(settings: Settings) -> str:
-    low_port = any(port < 1024 for port in settings.ports.as_dict().values())
+    enabled_ports = [
+        getattr(settings.ports, name)
+        for name, protocol in settings.protocols.items()
+        if protocol.enabled
+    ]
+    challenge_ports = settings.acme_challenge_ports() if settings.active_certificate_profiles() else []
+    low_port = any(port < 1024 for port in enabled_ports) or any(port < 1024 for port in challenge_ports)
     capability = "CAP_NET_BIND_SERVICE" if low_port else ""
     lines = [
         "[Unit]",
@@ -52,6 +58,7 @@ def singbox_unit(settings: Settings) -> str:
         "Restart=on-failure",
         "RestartSec=3s",
         "LimitNOFILE=1048576",
+        "UMask=0077",
         "NoNewPrivileges=true",
         "PrivateTmp=true",
         "PrivateDevices=true",
@@ -74,7 +81,7 @@ def singbox_unit(settings: Settings) -> str:
         f"AmbientCapabilities={capability}",
         "StateDirectory=sbox5-runtime",
         "RuntimeDirectory=sbox5-runtime",
-        "ReadWritePaths=/var/lib/sbox5-runtime /run/sbox5-runtime",
+        "ReadWritePaths=/var/lib/sbox5-runtime /run/sbox5-runtime /var/lib/sbox5/acme",
         "StandardOutput=journal",
         "StandardError=journal",
         "SyslogIdentifier=sbox5",
@@ -195,50 +202,6 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 
 [Install]
 WantedBy=multi-user.target
-"""
-
-
-def acme_unit() -> str:
-    return """[Unit]
-Description=sbox5 Certbot renewal and checked deployment
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/sbox5 acme-renew --non-interactive
-NoNewPrivileges=true
-PrivateTmp=true
-PrivateDevices=true
-ProtectSystem=full
-ProtectHome=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectKernelLogs=true
-ProtectControlGroups=true
-ProtectClock=true
-ProtectHostname=true
-RestrictSUIDSGID=true
-LockPersonality=true
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-ReadWritePaths=/etc/sbox5 /var/lib/sbox5 /var/log/sbox5-acme /run
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=sbox5-acme
-"""
-
-
-def acme_timer() -> str:
-    return """[Unit]
-Description=Schedule sbox5 certificate renewal
-
-[Timer]
-OnCalendar=daily
-RandomizedDelaySec=1h
-Persistent=true
-
-[Install]
-WantedBy=timers.target
 """
 
 

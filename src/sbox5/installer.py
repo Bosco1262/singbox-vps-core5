@@ -11,8 +11,19 @@ import subprocess
 from typing import Any
 
 from . import __version__
-from .certificates import certificate_metadata, create_self_signed, install_acme_certificate, issue_acme
-from .config import CERTIFICATE_PATH, KEY_PATH, build_server_config, check_server_config, config_bytes, generate_reality_keypair
+from .certificates import acme_profile_state, certificate_metadata, create_self_signed, imported_profile_state
+from .config import (
+    ACME_STATE_DIR,
+    CERTIFICATE_PATH,
+    KEY_PATH,
+    build_server_config,
+    check_server_config,
+    config_bytes,
+    generate_reality_keypair,
+    profile_acme_data_directory,
+    profile_certificate_path,
+    profile_key_path,
+)
 from .ddns import CloudflareDDNS
 from .download import install_locked_binary
 from .errors import ConfigError, ConflictError
@@ -21,8 +32,6 @@ from .firewall import apply_firewall, needs_firewall_service
 from .i18n import get_language, tr
 from .models import Secrets, Settings
 from .services import (
-    acme_timer,
-    acme_unit,
     argo_unit,
     copy_application,
     ddns_timer,
@@ -49,6 +58,7 @@ STATE_DIR = Path("/var/lib/sbox5")
 STATE_PATH = STATE_DIR / "state.json"
 FIREWALL_STATE_PATH = STATE_DIR / "firewall.json"
 CERTIFICATE_STATE_PATH = STATE_DIR / "certificate.json"
+CERTIFICATES_STATE_PATH = STATE_DIR / "certificates.json"
 DDNS_STATE_PATH = STATE_DIR / "ddns/last.json"
 EXPORT_DIR = STATE_DIR / "exports"
 SYSCTL_PATH = Path("/etc/sysctl.d/99-sbox5.conf")
@@ -80,13 +90,17 @@ def _excluded(path: Path) -> bool:
     )
 
 
-def managed_files() -> list[Path]:
+def managed_files(settings: Settings | None = None) -> list[Path]:
     files = {
         SETTINGS_PATH, SECRETS_PATH, SERVER_CONFIG_PATH, ARGO_TOKEN_PATH, DDNS_TOKEN_PATH,
         CERTIFICATE_PATH, KEY_PATH, STATE_PATH, FIREWALL_STATE_PATH, CERTIFICATE_STATE_PATH,
-        DDNS_STATE_PATH, SYSCTL_PATH, Path("/usr/local/bin/sbox5"), SINGBOX_BINARY, CLOUDFLARED_BINARY,
+        CERTIFICATES_STATE_PATH, DDNS_STATE_PATH, SYSCTL_PATH, Path("/usr/local/bin/sbox5"), SINGBOX_BINARY, CLOUDFLARED_BINARY,
         *(UNIT_DIR / name for name in UNITS),
     }
+    if settings is not None:
+        for profile in settings.certificate_profiles:
+            files.add(profile_certificate_path(profile))
+            files.add(profile_key_path(profile))
     for root in (CONFIG_DIR, Path("/usr/local/libexec/sbox5"), STATE_DIR):
         if root.exists():
             for path in root.rglob("*"):
@@ -95,13 +109,19 @@ def managed_files() -> list[Path]:
     return sorted(files)
 
 
-def _managed_directories() -> list[Path]:
-    return [
-        CONFIG_DIR, CONFIG_DIR / "secrets", CONFIG_DIR / "tls", CONFIG_DIR / "acme/config",
-        STATE_DIR, SNAPSHOT_ROOT, STATE_DIR / "ddns", STATE_DIR / "exports", STATE_DIR / "acme/work",
-        Path("/var/lib/sbox5-runtime"), Path("/var/log/sbox5-acme"),
+def _managed_directories(settings: Settings | None = None) -> list[Path]:
+    directories = [
+        CONFIG_DIR, CONFIG_DIR / "secrets", CONFIG_DIR / "tls", CONFIG_DIR / "tls" / "default",
+        STATE_DIR, SNAPSHOT_ROOT, STATE_DIR / "ddns", STATE_DIR / "exports", ACME_STATE_DIR,
+        ACME_STATE_DIR / "default", Path("/var/lib/sbox5-runtime"),
         Path("/usr/local/libexec/sbox5"), Path("/usr/local/libexec/sbox5/app"), BINARY_DIR,
     ]
+    if settings is not None:
+        for profile in settings.certificate_profiles:
+            directories.append(profile_certificate_path(profile).parent)
+            if profile.mode == "acme":
+                directories.append(profile_acme_data_directory(profile))
+    return directories
 
 
 class InstallTransaction:
@@ -112,15 +132,21 @@ class InstallTransaction:
         secrets: Secrets,
         *,
         upgrade: bool,
+        reconfigure: bool = False,
+        feature: str = "install",
         ddns_token: str = "",
         argo_token: str = "",
+        import_files: dict[str, tuple[Path, Path]] | None = None,
     ) -> None:
         self.project_root = project_root.resolve()
         self.settings = settings
         self.secrets = secrets
         self.upgrade = upgrade
+        self.reconfigure = reconfigure
+        self.feature = feature
         self.ddns_token = ddns_token
         self.argo_token = argo_token
+        self.import_files = dict(import_files or {})
         self.snapshot: Snapshot | None = None
         self.previous_state: dict[str, Any] = {}
         self.previous_settings: Settings | None = None
@@ -173,10 +199,10 @@ class InstallTransaction:
             requested.append("sbox5-ddns")
         if self.settings.argo.enabled:
             requested.append("sbox5-argo")
-        if self.upgrade:
+        if self.upgrade or self.reconfigure:
             requested = sorted(set(requested + self.previous_state.get("users", [])))
         for name in requested:
-            created = ensure_system_user(name, allow_existing=self.upgrade)
+            created = ensure_system_user(name, allow_existing=self.upgrade or self.reconfigure)
             if created:
                 self.snapshot.manifest["users_created"].append(name)
         self.users = requested
@@ -242,9 +268,6 @@ class InstallTransaction:
             desired["sbox5-ddns.timer"] = ddns_timer(self.settings.ddns.interval_seconds)
         if needs_firewall_service(self.settings):
             desired["sbox5-firewall.service"] = firewall_unit()
-        if self.settings.certificate_mode == "acme":
-            desired["sbox5-acme.service"] = acme_unit()
-            desired["sbox5-acme.timer"] = acme_timer()
         for name in UNITS:
             path = UNIT_DIR / name
             if name in desired:
@@ -276,32 +299,39 @@ class InstallTransaction:
             CONFIG_DIR, Path("/usr/local/libexec/sbox5"), STATE_DIR,
             Path("/usr/local/bin/sbox5"), SYSCTL_PATH, *(UNIT_DIR / name for name in UNITS),
         )
-        if self.upgrade:
+        if self.upgrade or self.reconfigure:
             if not SETTINGS_PATH.is_file() or not SECRETS_PATH.is_file() or not STATE_PATH.is_file():
-                raise ConfigError(tr("A complete existing sbox5 installation was not found; cannot upgrade", "找不到完整的现有 sbox5 安装，不能升级"))
+                raise ConfigError(tr("A complete existing sbox5 installation was not found; cannot reconfigure", "找不到完整的现有 sbox5 安装，不能重新配置"))
             self.previous_state = load_json(STATE_PATH)
             self.previous_settings = load_settings()
             self.sysctls = self.previous_state.get("sysctls", [])
         elif any(path.exists() for path in fresh_markers):
             raise ConflictError(tr("Existing sbox5 paths were detected; to avoid taking over unknown files, use upgrade or inspect them manually first", "检测到已存在的 sbox5 路径；为避免接管未知文件，请使用 upgrade 或先人工检查"))
         self.snapshot = Snapshot.create(
-            SNAPSHOT_ROOT, self.project_root, managed_files(), _managed_directories(), UNITS,
+            SNAPSHOT_ROOT, self.project_root, managed_files(self.settings), _managed_directories(self.settings), UNITS,
+            feature=self.feature,
         )
         try:
             if self.settings.ddns.enabled:
                 self.snapshot.manifest["external_resources"].append({"type": "cloudflare-dns", "name": self.settings.ddns.record})
             if self.settings.argo.enabled:
                 self.snapshot.manifest["external_resources"].append({"type": "cloudflare-argo", "name": self.settings.argo.hostname})
-            if self.settings.certificate_mode == "acme":
-                self.snapshot.manifest["external_resources"].append({"type": "acme-local-state", "name": tr("/etc/sbox5/acme (preserved on rollback)", "/etc/sbox5/acme（回滚保留）")})
+            if any(profile.mode == "acme" for profile in self.settings.active_certificate_profiles()):
+                self.snapshot.manifest["external_resources"].append({"type": "acme-local-state", "name": tr("/var/lib/sbox5/acme (preserved on rollback)", "/var/lib/sbox5/acme（回滚保留）")})
             self._stop_existing_services()
             check_ports(self.settings)
-            self.snapshot.manifest["packages"] = ensure_packages(self.settings)
+            if not self.reconfigure:
+                self.snapshot.manifest["packages"] = ensure_packages(self.settings)
+            else:
+                self.snapshot.manifest["packages"] = self.previous_state.get("packages", {
+                    "installed_by_project": [], "upgraded_by_project": [], "removal_policy": "keep",
+                })
             self._create_users()
             self._mkdir(CONFIG_DIR, 0o711)
             self._mkdir(CONFIG_DIR / "secrets", 0o711)
             singbox_uid, singbox_gid = identity("sbox5")
             self._mkdir(CONFIG_DIR / "tls", 0o750, singbox_uid, singbox_gid)
+            self._mkdir(ACME_STATE_DIR, 0o700, singbox_uid, singbox_gid)
             self._mkdir(STATE_DIR, 0o711)
             self._mkdir(SNAPSHOT_ROOT, 0o700)
             self._mkdir(EXPORT_DIR, 0o700)
@@ -312,22 +342,29 @@ class InstallTransaction:
             self._mkdir(BINARY_DIR, 0o755)
             self._write_tokens()
             self._write_settings()
-            self.components["sing-box"] = install_locked_binary(
-                "sing-box", architecture(), self.project_root, SINGBOX_BINARY, STATE_DIR / "staging",
-            )
-            self._record(SINGBOX_BINARY)
+            if self.reconfigure:
+                if not SINGBOX_BINARY.is_file():
+                    raise ConfigError(tr("The installed sing-box binary is missing; run upgrade first", "已安装的 sing-box 二进制缺失；请先执行 upgrade"))
+                self.components = dict(self.previous_state.get("components", {}))
+            else:
+                self.components["sing-box"] = install_locked_binary(
+                    "sing-box", architecture(), self.project_root, SINGBOX_BINARY, STATE_DIR / "staging",
+                )
+                self._record(SINGBOX_BINARY)
             run([str(SINGBOX_BINARY), "version"], timeout=30)
             if not self.secrets.reality_private_key or not self.secrets.reality_public_key:
                 generate_reality_keypair(SINGBOX_BINARY, self.secrets)
                 self._write_settings()
             if self.settings.argo.enabled:
-                self.components["cloudflared"] = install_locked_binary(
-                    "cloudflared", architecture(), self.project_root, CLOUDFLARED_BINARY, STATE_DIR / "staging",
-                )
-                self._record(CLOUDFLARED_BINARY)
+                if not CLOUDFLARED_BINARY.is_file():
+                    self.components["cloudflared"] = install_locked_binary(
+                        "cloudflared", architecture(), self.project_root, CLOUDFLARED_BINARY, STATE_DIR / "staging",
+                    )
+                    self._record(CLOUDFLARED_BINARY)
                 run([str(CLOUDFLARED_BINARY), "--version"], timeout=30)
             else:
                 self._remove(CLOUDFLARED_BINARY)
+                self.components.pop("cloudflared", None)
             if (STATE_DIR / "staging").exists():
                 shutil.rmtree(STATE_DIR / "staging")
             for path in copy_application(self.project_root):
@@ -346,31 +383,76 @@ class InstallTransaction:
                 os.chown(DDNS_STATE_PATH, ddns_uid, ddns_gid)
                 self._record(DDNS_STATE_PATH)
                 self.snapshot.manifest["operations"].append({"type": "ddns.initial", "changes": result["changes"]})
-            if self.settings.certificate_mode == "self-signed":
-                preserve = (
-                    self.upgrade and CERTIFICATE_PATH.is_file() and KEY_PATH.is_file()
-                    and self.previous_settings and self.previous_settings.tls_server_name == self.settings.tls_server_name
-                )
-                metadata = certificate_metadata(CERTIFICATE_PATH) if preserve else create_self_signed(
-                    self.settings, CERTIFICATE_PATH, KEY_PATH, singbox_uid, singbox_gid,
-                )
-                if not preserve:
-                    self._record(CERTIFICATE_PATH)
-                    self._record(KEY_PATH)
-            else:
-                self._mkdir(CONFIG_DIR / "acme/config", 0o700)
-                self._mkdir(STATE_DIR / "acme/work", 0o700)
-                self._mkdir(Path("/var/log/sbox5-acme"), 0o700)
-                source = CONFIG_DIR / "acme/config/live" / self.settings.domain / "fullchain.pem"
-                if not source.is_file():
-                    issue_acme(self.settings.domain, self.settings.acme_email)
-                metadata = install_acme_certificate(self.settings.domain, CERTIFICATE_PATH, KEY_PATH, singbox_uid, singbox_gid)
-                self._record(CERTIFICATE_PATH)
-                self._record(KEY_PATH)
-            self._json(CERTIFICATE_STATE_PATH, metadata, 0o600)
+            certificate_states: dict[str, dict[str, Any]] = {}
+            if self.previous_settings is not None:
+                current_profiles = {profile.id: profile for profile in self.settings.certificate_profiles}
+                for previous_profile in self.previous_settings.certificate_profiles:
+                    current_profile = current_profiles.get(previous_profile.id)
+                    if current_profile is not None and current_profile.mode != "acme":
+                        continue
+                    self._remove(profile_certificate_path(previous_profile))
+                    self._remove(profile_key_path(previous_profile))
+                    try:
+                        profile_certificate_path(previous_profile).parent.rmdir()
+                    except OSError:
+                        pass
+            for profile in self.settings.certificate_profiles:
+                if profile.mode != "imported" or profile.id not in self.import_files:
+                    continue
+                source_certificate, source_key = self.import_files[profile.id]
+                if source_certificate.is_symlink() or source_key.is_symlink():
+                    raise ConfigError(tr("Imported certificate files must not be symbolic links", "导入证书文件不能是符号链接"))
+                if not source_certificate.is_file() or not source_key.is_file():
+                    raise ConfigError(tr("Imported certificate files must be regular files", "导入证书文件必须是普通文件"))
+                if source_certificate.stat().st_size > 1024 * 1024 or source_key.stat().st_size > 1024 * 1024:
+                    raise ConfigError(tr("Imported certificate files are too large", "导入证书文件过大"))
+                certificate_path = profile_certificate_path(profile)
+                key_path = profile_key_path(profile)
+                self._mkdir(certificate_path.parent, 0o750, singbox_uid, singbox_gid)
+                self._write(certificate_path, source_certificate.read_bytes(), 0o640, singbox_uid, singbox_gid)
+                self._write(key_path, source_key.read_bytes(), 0o600, singbox_uid, singbox_gid)
+                certificate_metadata(certificate_path)
+            for profile in self.settings.active_certificate_profiles():
+                certificate_path = profile_certificate_path(profile)
+                key_path = profile_key_path(profile)
+                self._mkdir(certificate_path.parent, 0o750, singbox_uid, singbox_gid)
+                if profile.mode == "self-signed":
+                    previous_profile = None
+                    if self.previous_settings is not None:
+                        previous_profile = next(
+                            (item for item in self.previous_settings.certificate_profiles if item.id == profile.id),
+                            None,
+                        )
+                    preserve = (
+                        self.upgrade
+                        and certificate_path.is_file()
+                        and key_path.is_file()
+                        and previous_profile is not None
+                        and previous_profile.server_name == profile.server_name
+                    )
+                    if preserve:
+                        metadata = certificate_metadata(certificate_path)
+                    else:
+                        metadata = create_self_signed(profile, certificate_path, key_path, singbox_uid, singbox_gid)
+                    self._record(certificate_path)
+                    self._record(key_path)
+                elif profile.mode == "imported":
+                    metadata = imported_profile_state(profile)
+                    self._record(certificate_path)
+                    self._record(key_path)
+                else:
+                    self._mkdir(profile_acme_data_directory(profile), 0o700, singbox_uid, singbox_gid)
+                    metadata = acme_profile_state(profile)
+                certificate_states[profile.id] = metadata
+            default_metadata = certificate_states.get("default", {})
+            self._json(CERTIFICATES_STATE_PATH, certificate_states, 0o600)
+            self._json(CERTIFICATE_STATE_PATH, default_metadata, 0o600)
             self._write(SERVER_CONFIG_PATH, config_bytes(build_server_config(self.settings, self.secrets)), 0o640, singbox_uid, singbox_gid)
             check_server_config(SINGBOX_BINARY, SERVER_CONFIG_PATH)
-            exported = export_nodes(self.settings, self.secrets, CERTIFICATE_PATH, metadata, EXPORT_DIR)
+            exported = export_nodes(
+                self.settings, self.secrets, CERTIFICATE_PATH, default_metadata, EXPORT_DIR,
+                certificates=certificate_states,
+            )
             for path in EXPORT_DIR.iterdir():
                 if path.is_file():
                     self._record(path)
@@ -390,31 +472,41 @@ class InstallTransaction:
                 self._record(DDNS_STATE_PATH)
                 enable_start("sbox5-ddns.timer")
                 require_active("sbox5-ddns.timer")
-            if self.settings.certificate_mode == "acme":
-                enable_start("sbox5-acme.timer")
-                require_active("sbox5-acme.timer")
             self.snapshot.record_nft_owned("after")
             for entry in self.snapshot.manifest["files"]:
                 path = Path(entry["path"])
                 if path.exists() or entry.get("after") is not None:
                     self._record(path)
             state = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "project_version": __version__,
                 "installed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "components": self.components,
                 "users": self.users,
                 "sysctls": self.sysctls,
+                "protocols": {name: protocol.as_dict() for name, protocol in self.settings.protocols.items()},
+                "certificate_profiles": [profile.as_dict() for profile in self.settings.certificate_profiles],
+                "certificates": certificate_states,
+                "packages": self.snapshot.manifest["packages"],
                 "managed_files": [entry["path"] for entry in self.snapshot.manifest["files"] if Path(entry["path"]).exists()],
                 "snapshot_id": self.snapshot.manifest["snapshot_id"],
                 "firewall": firewall_result,
             }
+            self.snapshot.manifest["certificates"] = [
+                {
+                    "id": profile.id,
+                    "mode": profile.mode,
+                    "domains": list(profile.domains),
+                    "challenge": profile.challenge,
+                }
+                for profile in self.settings.certificate_profiles
+            ]
             self._json(STATE_PATH, state, 0o600)
             self._record(STATE_PATH)
             self.snapshot.commit()
             self.committed = True
             try:
-                prune_snapshots(SNAPSHOT_ROOT, keep=3)
+                prune_snapshots(SNAPSHOT_ROOT, keep=5)
             except OSError as exc:
                 print(tr(f"Warning: failed to clean up old snapshots: {exc}", f"警告：旧快照清理失败：{exc}"))
             return {
@@ -431,3 +523,18 @@ class InstallTransaction:
             except Exception as rollback_error:
                 raise ConflictError(f"{exc}\n{rollback_error}") from exc
             raise ConflictError(tr(f"Installation failed and was rolled back automatically. The snapshot is kept at {self.snapshot.path}. Reason: {exc}", f"安装失败，已自动回滚。快照保留在 {self.snapshot.path}。原因：{exc}")) from exc
+
+
+def reconfigure(
+    project_root: Path,
+    settings: Settings,
+    secrets: Secrets,
+    feature: str = "reconfigure",
+    import_files: dict[str, tuple[Path, Path]] | None = None,
+) -> dict[str, Any]:
+    settings.validate()
+    secrets.validate()
+    return InstallTransaction(
+        project_root, settings, secrets, upgrade=True, reconfigure=True, feature=feature,
+        import_files=import_files,
+    ).run()

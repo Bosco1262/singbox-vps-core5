@@ -24,7 +24,7 @@ from sbox5.download import _safe_archive_member, _validate_url
 from sbox5.errors import ExternalCommandError, VerificationError
 from sbox5.firewall import _iptables_resources, apply_firewall, required_ports
 from sbox5.models import DDNSSettings, Settings
-from sbox5.services import acme_timer, argo_unit, singbox_unit
+from sbox5.services import argo_unit, singbox_unit
 from sbox5.snapshot import Snapshot, prune_snapshots
 from sbox5.util import atomic_json, sha256_file
 
@@ -132,6 +132,8 @@ class FirewallTests(unittest.TestCase):
         with patch("sbox5.firewall._iptables_executables", return_value=["iptables", "ip6tables"]):
             rules = _iptables_resources(configured)
         self.assertTrue(any(rule["table"] == "nat" and rule["ipv6"] for rule in rules))
+        self.assertTrue(any(rule["kind"] == "iptables-chain" and rule["chain"] == "SBOX5-INPUT" for rule in rules))
+        self.assertTrue(any(rule["kind"] == "iptables-jump" and rule["target"] == "SBOX5-PREROUTING" for rule in rules))
         self.assertFalse(any(rule.get("flush") for rule in rules))
 
     def test_manual_mode_records_only_owned_rule_removal(self):
@@ -151,6 +153,36 @@ class FirewallTests(unittest.TestCase):
             self.assertEqual(result["owned"], [])
             self.assertEqual(changes[0][1], "remove")
             self.assertEqual(json.loads(state.read_text(encoding="utf-8"))["backend"], "manual")
+
+    def test_iptables_apply_creates_isolated_chains_and_jumps(self):
+        configured = Settings(
+            host="198.51.100.20", reality_target="www.example.com:443", reality_sni="www.example.com",
+            port_hopping={"tuic": "30000:31000"},
+        )
+        configured.validate()
+        commands = []
+        changes = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 1 if "-C" in command else 0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "firewall.json"
+            with patch("sbox5.firewall.available", side_effect=lambda name: name == "iptables"), \
+                    patch("sbox5.firewall._ufw_active", return_value=False), \
+                    patch("sbox5.firewall._nft_table_exists", return_value=False), \
+                    patch("sbox5.firewall._nat_available", return_value=True), \
+                    patch("sbox5.firewall._chain_exists", return_value=False), \
+                    patch("sbox5.firewall._iptables_executables", return_value=["iptables"]), \
+                    patch("sbox5.firewall.run", side_effect=fake_run):
+                result = apply_firewall(configured, state, lambda resource, action: changes.append((resource, action)))
+        self.assertEqual(result["backend"], "iptables")
+        self.assertTrue(any(command[:4] == ["iptables", "-t", "filter", "-N"] and command[4] == "SBOX5-INPUT" for command in commands))
+        self.assertTrue(any(command[:4] == ["iptables", "-t", "nat", "-N"] and command[4] == "SBOX5-PREROUTING" for command in commands))
+        self.assertTrue(any(command[:5] == ["iptables", "-t", "filter", "-I", "INPUT"] for command in commands))
+        self.assertTrue(any(changes and resource["kind"] == "iptables-chain" for resource, action in changes))
+        self.assertTrue(any(resource["kind"] == "iptables-jump" for resource, action in changes))
 
 
 class SnapshotTests(unittest.TestCase):
@@ -216,6 +248,14 @@ class RecoveryTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.restore.validate_manifest(bad_sysctl, verified)
         self.restore.validate_manifest({"schema_version": 1}, verified)
+        self.restore.validate_manifest({
+            "schema_version": 2,
+            "services": [{"name": "sbox5.service", "backend": "systemd"}],
+            "firewall": {"owned": [
+                {"kind": "iptables-chain", "ipv6": False, "table": "nat", "chain": "SBOX5-PREROUTING", "action": "add"},
+                {"kind": "iptables-jump", "ipv6": False, "table": "nat", "chain": "PREROUTING", "target": "SBOX5-PREROUTING", "spec": ["-j", "SBOX5-PREROUTING"], "action": "add"},
+            ]},
+        }, verified)
 
     def test_drift_detection_and_uninstall_absence(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -258,18 +298,46 @@ class LockTests(unittest.TestCase):
 class CommandTests(unittest.TestCase):
     def test_internal_systemd_commands_accept_non_interactive(self):
         parser = build_parser()
-        for command in ("ddns-update", "firewall-apply", "acme-renew"):
+        for command in ("ddns-update", "firewall-apply"):
             args = parser.parse_args([command, "--non-interactive"])
             self.assertTrue(args.non_interactive)
 
+    def test_port_and_protocol_commands_parse(self):
+        parser = build_parser()
+        port = parser.parse_args(["port", "set", "--protocol", "tuic", "--port", "20000", "--yes"])
+        self.assertEqual((port.command, port.port_command, port.protocol, port.port), ("port", "set", "tuic", 20000))
+        hopping = parser.parse_args([
+            "port", "hopping", "set", "--protocol", "tuic", "--range", "30000:31000", "--yes",
+        ])
+        self.assertEqual((hopping.hopping_command, hopping.range), ("set", "30000:31000"))
+        protocol = parser.parse_args(["protocol", "set", "vmess", "--tls-profile", "none", "--yes"])
+        self.assertEqual((protocol.protocol_command, protocol.name, protocol.tls_profile), ("set", "vmess", "none"))
+        cert = parser.parse_args([
+            "cert", "add", "--id", "edge", "--mode", "acme", "--domain", "edge.example.com",
+            "--bind-protocol", "hysteria2", "--yes",
+        ])
+        self.assertEqual((cert.cert_command, cert.id, cert.mode, cert.domain, cert.bind_protocol),
+                         ("add", "edge", "acme", ["edge.example.com"], "hysteria2"))
+        bind = parser.parse_args(["cert", "bind", "--protocol", "vmess", "--profile", "none", "--yes"])
+        self.assertEqual((bind.cert_command, bind.protocol, bind.profile), ("bind", "vmess", "none"))
+
     def test_units_use_non_root_core_and_token_files(self):
-        configured = Settings(host="198.51.100.20", reality_target="www.example.com:443", reality_sni="www.example.com", certificate_mode="acme", domain="example.com")
+        configured = Settings(host="198.51.100.20", reality_target="www.example.com:443", reality_sni="www.example.com")
         configured.validate()
         unit = singbox_unit(configured)
         self.assertIn("User=sbox5", unit)
         self.assertNotIn("AmbientCapabilities=CAP_NET_BIND_SERVICE", unit)
         self.assertIn("--token-file /etc/sbox5/secrets/argo.token", argo_unit())
-        self.assertIn("RandomizedDelaySec=", acme_timer())
+
+    def test_native_acme_requires_low_port_capability(self):
+        configured = Settings(
+            host="198.51.100.20", reality_target="www.example.com:443",
+            reality_sni="www.example.com", certificate_mode="acme", domain="example.com",
+        )
+        configured.validate()
+        unit = singbox_unit(configured)
+        self.assertIn("AmbientCapabilities=CAP_NET_BIND_SERVICE", unit)
+        self.assertIn("ReadWritePaths=/var/lib/sbox5-runtime /run/sbox5-runtime /var/lib/sbox5/acme", unit)
 
 
 if __name__ == "__main__":

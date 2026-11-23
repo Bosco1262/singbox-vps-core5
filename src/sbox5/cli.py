@@ -8,13 +8,11 @@ from getpass import getpass
 import ipaddress
 import json
 from pathlib import Path
-import stat
 import subprocess
 import sys
 
 from . import __version__
-from .certificates import install_acme_certificate, renew_acme
-from .config import CERTIFICATE_PATH, KEY_PATH, check_server_config
+from .config import CERTIFICATE_PATH, check_server_config
 from .ddns import CloudflareDDNS
 from .errors import ConfigError, SBox5Error
 from .export import build_share_links, export_nodes
@@ -23,6 +21,7 @@ from .i18n import get_language, normalize_language, resolve_language, set_langua
 from .installer import (
     ARGO_TOKEN_PATH,
     CERTIFICATE_STATE_PATH,
+    CERTIFICATES_STATE_PATH,
     DDNS_STATE_PATH,
     DDNS_TOKEN_PATH,
     EXPORT_DIR,
@@ -32,12 +31,13 @@ from .installer import (
     InstallTransaction,
     load_secrets,
     load_settings,
+    reconfigure,
 )
-from .models import ArgoSettings, DDNSSettings, Ports, Secrets, Settings
-from .services import identity, require_active, restart
+from .models import ArgoSettings, CertificateProfile, DDNSSettings, PROTOCOLS, Ports, ProtocolSettings, Secrets, Settings
+from .services import require_active
 from .snapshot import SNAPSHOT_ROOT
 from .system import read_token_file, validate_token_text
-from .util import atomic_json, atomic_write, available, load_json, require_linux_root, run, split_host_port
+from .util import available, load_json, require_linux_root, run, split_host_port
 
 
 def _interactive(args: argparse.Namespace) -> bool:
@@ -64,16 +64,21 @@ def _add_install_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host")
     parser.add_argument("--reality-target")
     parser.add_argument("--reality-sni")
-    parser.add_argument("--certificate-mode", choices=("self-signed", "acme"))
+    parser.add_argument("--certificate-mode", choices=("self-signed", "acme", "imported"))
     parser.add_argument("--domain")
     parser.add_argument("--acme-email")
+    parser.add_argument("--tls-server-name")
+    parser.add_argument("--acme-challenge", choices=("http-01", "dns-01", "tls-alpn-01"))
+    parser.add_argument("--acme-dns-provider", default="cloudflare")
+    parser.add_argument("--acme-dns-token-file", type=Path)
+    parser.add_argument("--vmess-tls", action=argparse.BooleanOptionalAction, default=None)
     for protocol in ("vless", "vmess", "hysteria2", "tuic", "anytls"):
         parser.add_argument(f"--{protocol}-port", type=int)
     parser.add_argument("--firewall", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--bbr", action=argparse.BooleanOptionalAction, default=None)
-    hopping = parser.add_mutually_exclusive_group()
-    hopping.add_argument("--hysteria2-port-hopping", metavar="START:END")
-    hopping.add_argument("--no-port-hopping", action="store_true")
+    parser.add_argument("--hysteria2-port-hopping", metavar="START:END")
+    parser.add_argument("--tuic-port-hopping", metavar="START:END")
+    parser.add_argument("--no-port-hopping", action="store_true")
     parser.add_argument("--ddns", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--cloudflare-zone")
     parser.add_argument("--ddns-record")
@@ -131,6 +136,31 @@ def _request(args: argparse.Namespace, upgrade: bool) -> tuple[Settings, Secrets
             domain = host
     if certificate_mode == "acme":
         domain = _prompt(domain, tr("ACME certificate domain", "ACME 证书域名"), args)
+    tls_server_name = args.tls_server_name or ""
+    if not tls_server_name and previous and certificate_mode == previous.certificate_mode:
+        tls_server_name = previous.tls_server_name
+    if certificate_mode == "imported" and not tls_server_name:
+        tls_server_name = _prompt("", tr("TLS server name for the imported certificate", "导入证书的 TLS server_name"), args)
+    acme_email = args.acme_email if args.acme_email is not None else (previous.acme_email if previous else "")
+    default_previous = None
+    if previous is not None:
+        default_previous = next((profile for profile in previous.certificate_profiles if profile.id == "default"), None)
+    challenge = args.acme_challenge or (default_previous.challenge if default_previous else "http-01")
+    dns_provider = args.acme_dns_provider or (default_previous.dns_provider if default_previous else "cloudflare")
+    profiles: list[CertificateProfile] = []
+    if previous is not None:
+        profiles.extend(profile for profile in previous.certificate_profiles if profile.id != "default")
+    profiles.insert(0, CertificateProfile(
+        id="default",
+        mode=certificate_mode,
+        domains=[domain] if certificate_mode == "acme" else [],
+        email=acme_email,
+        server_name=tls_server_name,
+        challenge=challenge,
+        dns_provider=dns_provider,
+        ca_provider=default_previous.ca_provider if default_previous else "letsencrypt",
+        acme_profile=default_previous.acme_profile if default_previous else "",
+    ))
     ports = Ports()
     for protocol in ports.as_dict():
         argument = getattr(args, f"{protocol}_port")
@@ -139,13 +169,24 @@ def _request(args: argparse.Namespace, upgrade: bool) -> tuple[Settings, Secrets
         elif previous:
             setattr(ports, protocol, getattr(previous.ports, protocol))
     hopping = dict(previous.port_hopping) if previous else {}
+    if args.no_port_hopping and (args.hysteria2_port_hopping or args.tuic_port_hopping):
+        raise ConfigError(tr(
+            "--no-port-hopping cannot be combined with a hopping range",
+            "--no-port-hopping 不能与跳跃范围同时使用",
+        ))
     if args.no_port_hopping:
         hopping = {}
-    elif args.hysteria2_port_hopping:
-        hopping = {"hysteria2": args.hysteria2_port_hopping}
-    tls_server_name = ""
-    if previous and certificate_mode == previous.certificate_mode:
-        tls_server_name = previous.tls_server_name
+    else:
+        if args.hysteria2_port_hopping:
+            hopping["hysteria2"] = args.hysteria2_port_hopping
+        if args.tuic_port_hopping:
+            hopping["tuic"] = args.tuic_port_hopping
+    protocols = {name: value for name, value in (previous.protocols.items() if previous else [])}
+    if args.vmess_tls is not None:
+        protocols.setdefault("vmess", previous.protocols["vmess"] if previous else None)
+        if protocols["vmess"] is None:
+            protocols["vmess"] = ProtocolSettings(True, "")
+        protocols["vmess"].tls_profile = "default" if args.vmess_tls else ""
     settings = Settings(
         host=host,
         reality_target=reality_target,
@@ -153,7 +194,7 @@ def _request(args: argparse.Namespace, upgrade: bool) -> tuple[Settings, Secrets
         ports=ports,
         domain=domain,
         certificate_mode=certificate_mode,
-        acme_email=args.acme_email if args.acme_email is not None else (previous.acme_email if previous else ""),
+        acme_email=acme_email,
         tls_server_name=tls_server_name,
         manage_firewall=args.firewall if args.firewall is not None else (previous.manage_firewall if previous else True),
         bbr=args.bbr if args.bbr is not None else (previous.bbr if previous else False),
@@ -170,6 +211,8 @@ def _request(args: argparse.Namespace, upgrade: bool) -> tuple[Settings, Secrets
             enabled=argo_enabled,
             hostname=args.argo_hostname or (previous.argo.hostname if previous else ""),
         ),
+        protocols=protocols,
+        certificate_profiles=profiles,
     )
     if argo_enabled:
         settings.argo.hostname = _prompt(settings.argo.hostname, tr("Argo public hostname", "Argo 公网域名"), args)
@@ -184,6 +227,16 @@ def _request(args: argparse.Namespace, upgrade: bool) -> tuple[Settings, Secrets
         ddns_token = validate_token_text(ddns_token, "Cloudflare Token")
     if argo_token:
         argo_token = validate_token_text(argo_token, "Argo Token")
+    for profile in settings.active_certificate_profiles():
+        if profile.mode != "acme" or profile.challenge != "dns-01":
+            continue
+        token = read_token_file(args.acme_dns_token_file, "ACME DNS Token") if args.acme_dns_token_file else ""
+        if not token:
+            token = secrets.acme_dns_tokens.get(profile.id, "")
+        if not token:
+            token = _prompt("", tr(f"ACME DNS API Token for {profile.id} (input hidden)", f"{profile.id} 的 ACME DNS API Token（输入不可见）"), args, secret=True)
+        secrets.acme_dns_tokens[profile.id] = validate_token_text(token, "ACME DNS Token")
+    secrets.validate()
     return settings, secrets, ddns_token, argo_token
 
 
@@ -202,7 +255,9 @@ def _install(args: argparse.Namespace, upgrade: bool) -> int:
     print(f" - {tr('Firewall auto-management', '防火墙自动管理')}: {settings.manage_firewall}; BBR: {settings.bbr}")
     _confirm(args, tr("Continue?", "确认继续吗？"))
     result = InstallTransaction(
-        args.project_root, settings, secrets, upgrade=upgrade, ddns_token=ddns_token, argo_token=argo_token,
+        args.project_root, settings, secrets, upgrade=upgrade,
+        feature="upgrade" if upgrade else "install",
+        ddns_token=ddns_token, argo_token=argo_token,
     ).run()
     print(tr("Install transaction committed.", "安装事务已提交。"))
     print(tr("Snapshot: ", "快照：") + result["snapshot"])
@@ -220,15 +275,23 @@ def _status() -> int:
     require_linux_root()
     state = load_json(STATE_PATH)
     print(json.dumps({
+        "schema_version": state.get("schema_version"),
         "project_version": state.get("project_version"),
         "installed_at": state.get("installed_at"),
         "components": state.get("components"),
+        "protocols": state.get("protocols"),
+        "certificate_profiles": state.get("certificate_profiles"),
         "snapshot_id": state.get("snapshot_id"),
     }, ensure_ascii=False, indent=2, sort_keys=True))
-    for name in ("sbox5.service", "sbox5-argo.service", "sbox5-ddns.timer", "sbox5-acme.timer", "sbox5-firewall.service"):
+    for name in ("sbox5.service", "sbox5-argo.service", "sbox5-ddns.timer", "sbox5-firewall.service"):
         if (Path("/etc/systemd/system") / name).exists():
             result = run(["systemctl", "is-active", name], check=False)
             print(f"{name}: {result.stdout.strip() or result.returncode}")
+    if CERTIFICATES_STATE_PATH.is_file():
+        print(tr("Certificates: ", "证书：") + json.dumps(load_json(CERTIFICATES_STATE_PATH), ensure_ascii=False, sort_keys=True))
+    if FIREWALL_STATE_PATH.is_file():
+        firewall_state = load_json(FIREWALL_STATE_PATH)
+        print(tr("Firewall: ", "防火墙：") + f"{firewall_state.get('backend')} ({len(firewall_state.get('owned', []))} owned)")
     if DDNS_STATE_PATH.is_file():
         print(tr("DDNS state: ", "DDNS 状态：") + json.dumps(load_json(DDNS_STATE_PATH), ensure_ascii=False, sort_keys=True))
     return 0
@@ -237,8 +300,9 @@ def _status() -> int:
 def _show(args: argparse.Namespace) -> int:
     require_linux_root()
     settings, secrets = load_settings(), load_secrets()
-    metadata = load_json(CERTIFICATE_STATE_PATH)
-    links = build_share_links(settings, secrets, metadata)
+    metadata = load_json(CERTIFICATE_STATE_PATH) if CERTIFICATE_STATE_PATH.is_file() else {}
+    certificates = load_json(CERTIFICATES_STATE_PATH) if CERTIFICATES_STATE_PATH.is_file() else {"default": metadata}
+    links = build_share_links(settings, secrets, metadata, certificates)
     if args.protocol:
         if args.protocol not in links:
             raise ConfigError(tr("This node is not enabled", "该节点未启用"))
@@ -263,8 +327,12 @@ def _show(args: argparse.Namespace) -> int:
 def _export() -> int:
     require_linux_root()
     settings, secrets = load_settings(), load_secrets()
-    metadata = load_json(CERTIFICATE_STATE_PATH)
-    result = export_nodes(settings, secrets, CERTIFICATE_PATH, metadata, EXPORT_DIR)
+    metadata = load_json(CERTIFICATE_STATE_PATH) if CERTIFICATE_STATE_PATH.is_file() else {}
+    certificates = load_json(CERTIFICATES_STATE_PATH) if CERTIFICATES_STATE_PATH.is_file() else {"default": metadata}
+    result = export_nodes(
+        settings, secrets, CERTIFICATE_PATH, metadata, EXPORT_DIR,
+        certificates=certificates,
+    )
     check_server_config(SINGBOX_BINARY, EXPORT_DIR / "sing-box-client.json")
     print(tr("Exported to ", "已导出到 ") + str(EXPORT_DIR))
     for warning in result["warnings"]:
@@ -305,34 +373,144 @@ def _firewall_apply() -> int:
     return 0
 
 
-def _acme_renew() -> int:
-    require_linux_root()
-    settings = load_settings()
-    if settings.certificate_mode != "acme":
-        raise ConfigError(tr("The current mode is not ACME", "当前不是 ACME 模式"))
-    old_certificate, old_key = CERTIFICATE_PATH.read_bytes(), KEY_PATH.read_bytes()
-    cert_stat, key_stat = CERTIFICATE_PATH.stat(), KEY_PATH.stat()
-    renew_acme()
-    uid, gid = identity("sbox5")
-    try:
-        metadata = install_acme_certificate(settings.domain, CERTIFICATE_PATH, KEY_PATH, uid, gid)
-        check_server_config(SINGBOX_BINARY, Path("/etc/sbox5/config.json"))
-        if old_certificate != CERTIFICATE_PATH.read_bytes() or old_key != KEY_PATH.read_bytes():
-            restart("sbox5.service")
-            require_active("sbox5.service")
-    except Exception as exc:
-        atomic_write(CERTIFICATE_PATH, old_certificate, stat.S_IMODE(cert_stat.st_mode), cert_stat.st_uid, cert_stat.st_gid)
-        atomic_write(KEY_PATH, old_key, stat.S_IMODE(key_stat.st_mode), key_stat.st_uid, key_stat.st_gid)
-        check_server_config(SINGBOX_BINARY, Path("/etc/sbox5/config.json"))
-        restart("sbox5.service")
-        raise ConfigError(tr(f"Failed to deploy the new certificate; the previous certificate was restored: {exc}", f"新证书部署失败，已恢复旧证书：{exc}")) from exc
-    atomic_json(CERTIFICATE_STATE_PATH, metadata, 0o600)
-    try:
-        export_nodes(settings, load_secrets(), CERTIFICATE_PATH, metadata, EXPORT_DIR)
-    except SBox5Error as exc:
-        print(tr(f"Warning: the certificate was updated but refreshing the exported files failed: {exc}", f"警告：证书已更新，但导出文件刷新失败：{exc}"), file=sys.stderr)
-    print(tr("ACME renewal and configuration check completed.", "ACME 续期与配置检查完成。"))
+def _apply_reconfigure(
+    args: argparse.Namespace,
+    settings: Settings,
+    secrets: Secrets,
+    feature: str,
+    import_files: dict[str, tuple[Path, Path]] | None = None,
+) -> int:
+    settings.validate()
+    secrets.validate()
+    _confirm(args, tr("Apply this configuration change and restart services?", "应用此配置变更并重启服务吗？"))
+    result = reconfigure(args.project_root, settings, secrets, feature, import_files=import_files)
+    print(tr("Configuration transaction committed.", "配置事务已提交。"))
+    print(tr("Snapshot: ", "快照：") + result["snapshot"])
+    print(tr("Client export directory: ", "客户端导出目录：") + result["exports"])
+    for warning in result["warnings"]:
+        print(tr("Warning: ", "警告：") + warning)
     return 0
+
+
+def _port(args: argparse.Namespace) -> int:
+    require_linux_root()
+    settings, secrets = load_settings(), load_secrets()
+    if args.port_command == "set":
+        setattr(settings.ports, args.protocol, args.port)
+    elif args.port_command == "hopping":
+        if args.hopping_command == "set":
+            settings.port_hopping[args.protocol] = args.range
+        else:
+            settings.port_hopping.pop(args.protocol, None)
+    else:
+        raise ConfigError(tr("Unknown port command", "未知端口命令"))
+    return _apply_reconfigure(args, settings, secrets, "port")
+
+
+def _protocol(args: argparse.Namespace) -> int:
+    require_linux_root()
+    settings, secrets = load_settings(), load_secrets()
+    protocol = settings.protocols[args.name]
+    if args.enabled:
+        protocol.enabled = True
+    elif args.disabled:
+        protocol.enabled = False
+    if args.tls_profile is not None:
+        if args.name == "vless":
+            raise ConfigError(tr("VLESS uses Reality and does not accept a TLS profile", "VLESS 使用 Reality，不接受 TLS 配置"))
+        protocol.tls_profile = "" if args.tls_profile.lower() in ("none", "off", "disabled") else args.tls_profile
+    return _apply_reconfigure(args, settings, secrets, "protocol")
+
+
+def _certificate(args: argparse.Namespace) -> int:
+    require_linux_root()
+    settings, secrets = load_settings(), load_secrets()
+    if args.cert_command == "list":
+        data = {
+            "profiles": [profile.as_dict() for profile in settings.certificate_profiles],
+            "bindings": {
+                name: protocol.tls_profile
+                for name, protocol in settings.protocols.items()
+                if name != "vless"
+            },
+        }
+        if CERTIFICATES_STATE_PATH.is_file():
+            data["state"] = load_json(CERTIFICATES_STATE_PATH)
+        if args.json:
+            print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True))
+        else:
+            for profile in settings.certificate_profiles:
+                print(
+                    f"{profile.id}\t{profile.mode}\t{profile.server_name}\t"
+                    f"{','.join(profile.domains)}\t{profile.challenge if profile.mode == 'acme' else '-'}"
+                )
+            print(tr("Bindings: ", "绑定：") + json.dumps(data["bindings"], ensure_ascii=False, sort_keys=True))
+        return 0
+
+    import_files: dict[str, tuple[Path, Path]] = {}
+    if args.cert_command == "add":
+        if any(profile.id == args.id for profile in settings.certificate_profiles):
+            raise ConfigError(tr(f"Certificate profile already exists: {args.id}", f"证书配置已存在：{args.id}"))
+        profile = CertificateProfile(
+            id=args.id,
+            mode=args.mode,
+            domains=list(args.domain or []),
+            email=args.email or "",
+            server_name=args.server_name or "",
+            challenge=args.challenge or "http-01",
+            dns_provider=args.dns_provider or "cloudflare",
+            ca_provider=args.ca_provider or "letsencrypt",
+            acme_profile=args.acme_profile or "",
+        )
+        profile.validate()
+        if any(existing.id == profile.id for existing in settings.certificate_profiles):
+            raise ConfigError(tr(f"Certificate profile already exists: {profile.id}", f"证书配置已存在：{profile.id}"))
+        if profile.mode == "imported":
+            if not args.cert or not args.key:
+                raise ConfigError(tr("Imported profiles require --cert and --key", "导入证书配置需要 --cert 和 --key"))
+            import_files[profile.id] = (args.cert, args.key)
+        if profile.mode == "acme" and profile.challenge == "dns-01":
+            token = read_token_file(args.dns_token_file, "ACME DNS Token") if args.dns_token_file else ""
+            if not token:
+                token = _prompt(
+                    "", tr(f"ACME DNS API Token for {profile.id} (input hidden)", f"{profile.id} 的 ACME DNS API Token（输入不可见）"),
+                    args, secret=True,
+                )
+            secrets.acme_dns_tokens[profile.id] = validate_token_text(token, "ACME DNS Token")
+        settings.certificate_profiles.append(profile)
+        if args.bind_protocol:
+            if args.bind_protocol == "vless":
+                raise ConfigError(tr("VLESS uses Reality and cannot bind a certificate profile", "VLESS 使用 Reality，不能绑定证书配置"))
+            settings.protocols[args.bind_protocol].tls_profile = profile.id
+        return _apply_reconfigure(args, settings, secrets, "certificate", import_files)
+
+    if args.cert_command == "remove":
+        if args.id == "default":
+            raise ConfigError(tr("The default certificate profile cannot be removed", "不能删除 default 证书配置"))
+        if any(protocol.tls_profile == args.id for protocol in settings.protocols.values()):
+            raise ConfigError(tr(
+                f"Certificate profile {args.id} is still bound to a protocol; unbind it first",
+                f"证书配置 {args.id} 仍绑定到协议；请先解除绑定",
+            ))
+        if not any(profile.id == args.id for profile in settings.certificate_profiles):
+            raise ConfigError(tr(f"Certificate profile not found: {args.id}", f"证书配置不存在：{args.id}"))
+        settings.certificate_profiles = [profile for profile in settings.certificate_profiles if profile.id != args.id]
+        secrets.acme_dns_tokens.pop(args.id, None)
+        return _apply_reconfigure(args, settings, secrets, "certificate")
+
+    if args.cert_command == "bind":
+        if args.protocol == "vless":
+            raise ConfigError(tr("VLESS uses Reality and cannot bind a certificate profile", "VLESS 使用 Reality，不能绑定证书配置"))
+        if args.profile.lower() not in ("none", "off", "disabled") and not any(
+            profile.id == args.profile for profile in settings.certificate_profiles
+        ):
+            raise ConfigError(tr(f"Certificate profile not found: {args.profile}", f"证书配置不存在：{args.profile}"))
+        settings.protocols[args.protocol].tls_profile = (
+            "" if args.profile.lower() in ("none", "off", "disabled") else args.profile
+        )
+        return _apply_reconfigure(args, settings, secrets, "certificate")
+
+    raise ConfigError(tr("Unknown certificate command", "未知证书命令"))
 
 
 def _snapshots() -> int:
@@ -392,9 +570,58 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("--qr", action="store_true")
     commands.add_parser("export", parents=[language], help=tr("Re-export local client files", "重新导出本地客户端文件"))
     commands.add_parser("check", parents=[language], help=tr("Validate server and client configurations", "检查服务端和客户端配置"))
+    port = commands.add_parser("port", parents=[language], help=tr("Change protocol ports or UDP hopping ranges", "修改协议端口或 UDP 跳跃范围"))
+    port_commands = port.add_subparsers(dest="port_command", required=True)
+    port_set = port_commands.add_parser("set", parents=[language], help=tr("Change one protocol port", "修改单个协议端口"))
+    port_set.add_argument("--protocol", choices=PROTOCOLS, required=True)
+    port_set.add_argument("--port", type=int, required=True)
+    port_set.add_argument("--yes", action="store_true")
+    hopping = port_commands.add_parser("hopping", parents=[language], help=tr("Manage UDP port-hopping ranges", "管理 UDP 端口跳跃范围"))
+    hopping_commands = hopping.add_subparsers(dest="hopping_command", required=True)
+    hopping_set = hopping_commands.add_parser("set", parents=[language], help=tr("Set a UDP hopping range", "设置 UDP 跳跃范围"))
+    hopping_set.add_argument("--protocol", choices=("hysteria2", "tuic"), required=True)
+    hopping_set.add_argument("--range", required=True, metavar="START:END")
+    hopping_set.add_argument("--yes", action="store_true")
+    hopping_clear = hopping_commands.add_parser("clear", parents=[language], help=tr("Clear a UDP hopping range", "清除 UDP 跳跃范围"))
+    hopping_clear.add_argument("--protocol", choices=("hysteria2", "tuic"), required=True)
+    hopping_clear.add_argument("--yes", action="store_true")
+    protocol = commands.add_parser("protocol", parents=[language], help=tr("Enable, disable, or re-bind a protocol", "启用、禁用或重新绑定协议"))
+    protocol_commands = protocol.add_subparsers(dest="protocol_command", required=True)
+    protocol_set = protocol_commands.add_parser("set", parents=[language], help=tr("Change protocol state or TLS profile", "修改协议状态或 TLS 配置"))
+    protocol_set.add_argument("name", choices=PROTOCOLS)
+    state = protocol_set.add_mutually_exclusive_group()
+    state.add_argument("--enabled", action="store_true")
+    state.add_argument("--disabled", action="store_true")
+    protocol_set.add_argument("--tls-profile", help=tr("TLS profile ID, or 'none' to disable VMess TLS", "TLS 配置 ID，或用 none 关闭 VMess TLS"))
+    protocol_set.add_argument("--yes", action="store_true")
+    cert = commands.add_parser("cert", parents=[language], help=tr("Manage certificate profiles and bindings", "管理证书配置与绑定"))
+    cert_commands = cert.add_subparsers(dest="cert_command", required=True)
+    cert_list = cert_commands.add_parser("list", parents=[language], help=tr("List certificate profiles", "列出证书配置"))
+    cert_list.add_argument("--json", action="store_true")
+    cert_add = cert_commands.add_parser("add", parents=[language], help=tr("Add a certificate profile", "添加证书配置"))
+    cert_add.add_argument("--id", required=True)
+    cert_add.add_argument("--mode", choices=("self-signed", "acme", "imported"), required=True)
+    cert_add.add_argument("--domain", action="append", default=[])
+    cert_add.add_argument("--email")
+    cert_add.add_argument("--server-name")
+    cert_add.add_argument("--challenge", choices=("http-01", "dns-01", "tls-alpn-01"))
+    cert_add.add_argument("--dns-provider", default="cloudflare")
+    cert_add.add_argument("--ca-provider", default="letsencrypt")
+    cert_add.add_argument("--acme-profile")
+    cert_add.add_argument("--dns-token-file", type=Path)
+    cert_add.add_argument("--cert", type=Path)
+    cert_add.add_argument("--key", type=Path)
+    cert_add.add_argument("--bind-protocol", choices=PROTOCOLS)
+    cert_add.add_argument("--yes", action="store_true")
+    cert_remove = cert_commands.add_parser("remove", parents=[language], help=tr("Remove an unbound certificate profile", "删除未绑定的证书配置"))
+    cert_remove.add_argument("--id", required=True)
+    cert_remove.add_argument("--yes", action="store_true")
+    cert_bind = cert_commands.add_parser("bind", parents=[language], help=tr("Bind a protocol to a certificate profile", "将协议绑定到证书配置"))
+    cert_bind.add_argument("--protocol", choices=PROTOCOLS, required=True)
+    cert_bind.add_argument("--profile", required=True, help=tr("Profile ID, or 'none'", "配置 ID，或 none"))
+    cert_bind.add_argument("--yes", action="store_true")
     commands.add_parser("ddns-update", parents=[language], help=argparse.SUPPRESS).add_argument("--non-interactive", action="store_true")
     commands.add_parser("firewall-apply", parents=[language], help=argparse.SUPPRESS).add_argument("--non-interactive", action="store_true")
-    commands.add_parser("acme-renew", parents=[language], help=argparse.SUPPRESS).add_argument("--non-interactive", action="store_true")
     commands.add_parser("snapshots", parents=[language], help=tr("List transaction snapshots", "列出事务快照"))
     rollback = commands.add_parser("rollback", parents=[language], help=tr("Restore a snapshot with the standalone restorer", "使用独立恢复器恢复快照"))
     rollback.add_argument("--snapshot", type=Path)
@@ -402,7 +629,7 @@ def build_parser() -> argparse.ArgumentParser:
     uninstall = commands.add_parser("uninstall", parents=[language], help=tr("Remove project files and rules, keeping snapshots and packages", "移除项目文件和规则，保留快照与软件包"))
     uninstall.add_argument("--yes", action="store_true")
     uninstall.add_argument("--non-interactive", action="store_true")
-    hidden = {"ddns-update", "firewall-apply", "acme-renew"}
+    hidden = {"ddns-update", "firewall-apply"}
     commands._choices_actions = [action for action in commands._choices_actions if action.dest not in hidden]
     return parser
 
@@ -429,12 +656,16 @@ def main(argv: list[str] | None = None) -> int:
             return _export()
         if args.command == "check":
             return _check()
+        if args.command == "port":
+            return _port(args)
+        if args.command == "protocol":
+            return _protocol(args)
+        if args.command == "cert":
+            return _certificate(args)
         if args.command == "ddns-update":
             return _ddns_update()
         if args.command == "firewall-apply":
             return _firewall_apply()
-        if args.command == "acme-renew":
-            return _acme_renew()
         if args.command == "snapshots":
             return _snapshots()
         if args.command == "rollback":
