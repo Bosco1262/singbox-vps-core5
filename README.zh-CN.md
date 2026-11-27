@@ -5,7 +5,7 @@
 [![License: GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://www.python.org/)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Debian%2012%2B%20%7C%20Ubuntu%2022.04%2B%20%7C%20Alpine%203.20%2B%20%7C%20RHEL%209%2B-orange.svg)]()
-[![Tests: 90 Passed](https://img.shields.io/badge/Tests-90%20Passed-brightgreen.svg)]()
+[![Tests: 116 Passed](https://img.shields.io/badge/Tests-116%20Passed-brightgreen.svg)]()
 
 **singbox-vps-core5** (`sbox5`) 是一个面向 Linux VPS 的生产加固、可审计且支持故障回滚的多协议代理套件。在严苛的安全隔离、非 root systemd 沙盒与不可变供应链锁的保护下，实现五大现代协议（**VLESS-Reality**、**VMess-WS**、**Hysteria2**、**TUIC v5** 与 **AnyTLS**）的原生平滑共存。
 
@@ -55,7 +55,7 @@ sudo git clone https://github.com/Bosco1262/singbox-vps-core5.git /usr/local/src
 cd /usr/local/src/singbox-vps-core5
 
 # 拉取后赋予执行权限
-sudo chmod +x install.sh sbox5
+sudo chmod +x install.sh sbox5 sb.sh
 
 # 运行安装程序（交互式引导）
 sudo ./install.sh
@@ -76,8 +76,13 @@ sbox5 <subcommand>
 
   install      全新安装（支持交互式引导或全参数自动安装）
   upgrade      按 locks 锁文件无缝升级核心程序（复用原有配置）
-  status       查看服务状态、组件版本、协议与证书配置（--geo 可选查询 IP 归属地）
+  status       查看服务状态、组件版本、协议与证书配置（--text 输出面板，--geo 可选查询 IP 归属地）
   menu         交互式面板：状态、日志、健康检查与常用操作
+  service      启动、停止、重启或查看服务（core|argo|ddns|subscription|firewall）
+  bbr          查看、开启或关闭 BBR
+  reality set  修改 Reality 目标与 SNI
+  secrets rotate 轮换协议 UUID、密码与 VMess 路径
+  self-update  快进受信 git 工作区（仅 HTTPS origin）
   doctor       本地健康检查（--json 便于自动化）
   logs         查看服务日志（--service core|argo|ddns|subscription|firewall，--follow）
   ip show      显示探测到的全局 IPv4/IPv6 地址
@@ -103,9 +108,21 @@ sbox5 <subcommand>
   uninstall    安全卸载（自动拍摄快照，清理规则与文件，保留软件包）
 ```
 
+### 上游兼容控制台（`sb.sh`）
+
+`sudo ./sb.sh` 打开上游风格的编号菜单。它只是展示层：所有操作都调用 `sbox5` CLI，因此快照、哈希锁、`sing-box check`、非 root 服务与防火墙隔离全部保持生效。
+
+- 控制台不会编辑 `/etc/sbox5`、不会直接调用 `systemctl`/`nft`/`iptables`，也不会下载远程脚本。
+- 菜单 7.1 只对干净的 git 工作区执行固定 HTTPS origin 的快进拉取，不执行远程代码。
+- 有意不包含：Telegram/GitLab 推送、WARP-plus/Psiphon、Serv00/FreeBSD、旧 `/etc/s-box`。
+- 不创建全局 `sb` 快捷方式，请在仓库内运行。
+- `sbox5 menu` 仍是原生的紧凑菜单。
+
 ---
 
 ## 交互安装参数
+
+全新安装时，未显式指定的协议端口会从 `10000-65535` 中随机选择，并同时校验 TCP/UDP 是否空闲；升级或重新配置会沿用原有端口。
 
 | 参数项                         | 说明                                        | 默认值 / 选项                            |
 | :----------------------------- | :------------------------------------------ | :--------------------------------------- |
@@ -120,11 +137,11 @@ sbox5 <subcommand>
 | `--acme-dns-token-file`        | DNS-01 API Token 文件                       | root 可读普通文件；原生 ACME 运行时会写入 `config.json`（`0640 root:sbox5`） |
 | `--tls-server-name`            | 自签/导入证书的 TLS server_name             | 自签模式自动生成                         |
 | `--vmess-tls` / `--no-vmess-tls` | 是否启用 VMess TLS                        | 默认关闭；与 Argo 互斥                   |
-| `--vless-port`                 | VLESS-Reality 监听端口                      | 默认 `18443`                             |
-| `--vmess-port`                 | VMess-WebSocket 监听端口                    | 默认 `18080`                             |
-| `--hysteria2-port`             | Hysteria2 UDP 监听端口                      | 默认 `18444`                             |
-| `--tuic-port`                  | TUIC v5 UDP 监听端口                        | 默认 `18445`                             |
-| `--anytls-port`                | AnyTLS TCP 监听端口                         | 默认 `18446`                             |
+| `--vless-port`                 | VLESS-Reality 监听端口                      | 全新安装时随机空闲端口                   |
+| `--vmess-port`                 | VMess-WebSocket 监听端口                    | 全新安装时随机空闲端口                   |
+| `--hysteria2-port`             | Hysteria2 UDP 监听端口                      | 全新安装时随机空闲端口                   |
+| `--tuic-port`                  | TUIC v5 UDP 监听端口                        | 全新安装时随机空闲端口                   |
+| `--anytls-port`                | AnyTLS TCP 监听端口                         | 全新安装时随机空闲端口                   |
 | `--hysteria2-port-hopping`     | Hysteria2 UDP 跳跃范围                      | 可选，如 `20000:30000`                   |
 | `--tuic-port-hopping`          | TUIC UDP 跳跃范围                           | 可选，如 `30000:40000`                   |
 | `--ddns` / `--no-ddns`         | 是否启用 Cloudflare DDNS                    | 默认禁用                                 |

@@ -5,7 +5,7 @@
 [![License: GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://www.python.org/)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Debian%2012%2B%20%7C%20Ubuntu%2022.04%2B%20%7C%20Alpine%203.20%2B%20%7C%20RHEL%209%2B-orange.svg)]()
-[![Tests: 90 Passed](https://img.shields.io/badge/Tests-90%20Passed-brightgreen.svg)]()
+[![Tests: 116 Passed](https://img.shields.io/badge/Tests-116%20Passed-brightgreen.svg)]()
 
 **singbox-vps-core5** (`sbox5`) is a production-hardened, auditable, and rollback-ready proxy suite for Linux VPS. It enables seamless coexistence of five modern protocols (**VLESS-Reality**, **VMess-WS**, **Hysteria2**, **TUIC v5**, and **AnyTLS**) under strict security isolation, non-root systemd sandboxing, and immutable supply-chain locking.
 
@@ -55,7 +55,7 @@ sudo git clone https://github.com/Bosco1262/singbox-vps-core5.git /usr/local/src
 cd /usr/local/src/singbox-vps-core5
 
 # Grant execute permissions after cloning
-sudo chmod +x install.sh sbox5
+sudo chmod +x install.sh sbox5 sb.sh
 
 # Run installer (Interactive mode)
 sudo ./install.sh
@@ -75,8 +75,13 @@ sbox5 <subcommand>
 
   install      Fresh installation (interactive guidance or parameter-driven)
   upgrade      Seamless core component upgrade based on lock files
-  status       Display non-sensitive service status, versions, protocols, and certificate profiles (--geo for optional IP geolocation)
+  status       Display non-sensitive service status, versions, protocols, and certificate profiles (--text for the dashboard, --geo for optional IP geolocation)
   menu         Interactive dashboard for status, logs, health checks, and common changes
+  service      Start, stop, restart, or inspect a service (core|argo|ddns|subscription|firewall)
+  bbr          Show, enable, or disable BBR
+  reality set  Change the Reality target and SNI
+  secrets rotate Rotate protocol UUIDs, passwords, and the VMess path
+  self-update  Fast-forward the trusted git checkout (HTTPS origin only)
   doctor       Run local health checks (--json for automation)
   logs         Show service logs (--service core|argo|ddns|subscription|firewall, --follow)
   ip show      Show detected global IPv4/IPv6 addresses
@@ -102,9 +107,21 @@ sbox5 <subcommand>
   uninstall    Safe uninstall (creates snapshot, cleans rules and files, preserves packages)
 ```
 
+### Upstream-compatible console (`sb.sh`)
+
+`sudo ./sb.sh` opens a numbered console that follows the familiar upstream menu flow. It is a presentation layer only: every action calls the `sbox5` CLI, so snapshots, hash locks, `sing-box check`, non-root services, and firewall isolation remain in force.
+
+- The console never edits `/etc/sbox5`, calls `systemctl`/`nft`/`iptables`, or downloads remote scripts.
+- Menu 7.1 only fast-forwards a clean git checkout from the pinned HTTPS origin; it never executes remote code.
+- Intentionally not included: Telegram/GitLab push, WARP-plus/Psiphon, Serv00/FreeBSD, and the legacy `/etc/s-box`.
+- No global `sb` shortcut is installed; run the script from the repository.
+- `sbox5 menu` remains the compact native menu.
+
 ---
 
 ## Interactive Installation Options
+
+On a fresh install, any protocol port not provided explicitly is randomly selected from `10000-65535` and verified free for both TCP and UDP. Upgrades and reconfigurations keep the existing ports.
 
 | Option | Description | Default / Choices |
 | :--- | :--- | :--- |
@@ -119,11 +136,11 @@ sbox5 <subcommand>
 | `--acme-dns-token-file` | DNS-01 API token file | Root-readable regular file; native ACME places the token in `config.json` (`0640 root:sbox5`) at runtime |
 | `--tls-server-name` | TLS server name for self-signed/imported profiles | Auto-generated for self-signed |
 | `--vmess-tls` / `--no-vmess-tls` | Enable VMess TLS | Default disabled; incompatible with Argo |
-| `--vless-port` | VLESS-Reality listening port | Default `18443` |
-| `--vmess-port` | VMess-WebSocket listening port | Default `18080` |
-| `--hysteria2-port` | Hysteria2 UDP listening port | Default `18444` |
-| `--tuic-port` | TUIC v5 UDP listening port | Default `18445` |
-| `--anytls-port` | AnyTLS TCP listening port | Default `18446` |
+| `--vless-port` | VLESS-Reality listening port | Random free port on fresh install |
+| `--vmess-port` | VMess-WebSocket listening port | Random free port on fresh install |
+| `--hysteria2-port` | Hysteria2 UDP listening port | Random free port on fresh install |
+| `--tuic-port` | TUIC v5 UDP listening port | Random free port on fresh install |
+| `--anytls-port` | AnyTLS TCP listening port | Random free port on fresh install |
 | `--hysteria2-port-hopping`| Hysteria2 UDP hopping range | Optional, e.g., `20000:30000` |
 | `--tuic-port-hopping` | TUIC UDP hopping range | Optional, e.g., `30000:40000` |
 | `--ddns` / `--no-ddns` | Enable Cloudflare DDNS | Default disabled |

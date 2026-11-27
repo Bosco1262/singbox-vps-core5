@@ -41,6 +41,14 @@ def global_addresses() -> dict[int, list[str]]:
     return result
 
 
+def preferred_host() -> str:
+    addresses = global_addresses()
+    for family in (4, 6):
+        if addresses[family]:
+            return addresses[family][0]
+    return ""
+
+
 def output_host(settings: Settings) -> str:
     if settings.output_family == "auto":
         return settings.host

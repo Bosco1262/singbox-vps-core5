@@ -1029,6 +1029,26 @@ class Secrets:
     warp: WarpCredential = field(default_factory=WarpCredential)
     socks5_password: str = ""
 
+    def rotate(self, scope: str = "all") -> None:
+        if scope not in ("all", *PROTOCOLS):
+            raise ConfigError(tr(f"Unknown secret scope: {scope}", f"未知密钥范围：{scope}"))
+        if scope in ("all", "vless"):
+            self.vless_uuid = str(uuid.uuid4())
+            self.reality_short_id = random_secrets.token_hex(8)
+        if scope in ("all", "vmess"):
+            self.vmess_uuid = str(uuid.uuid4())
+            self.vmess_path = "/" + random_secrets.token_urlsafe(24)
+        if scope in ("all", "hysteria2"):
+            self.hysteria2_password = random_secrets.token_urlsafe(32)
+            self.hysteria2_obfs_password = random_secrets.token_urlsafe(32)
+            if self.hysteria2_obfs_password == self.hysteria2_password:
+                self.hysteria2_obfs_password = random_secrets.token_urlsafe(32)
+        if scope in ("all", "tuic"):
+            self.tuic_uuid = str(uuid.uuid4())
+            self.tuic_password = random_secrets.token_urlsafe(32)
+        if scope in ("all", "anytls"):
+            self.anytls_password = random_secrets.token_urlsafe(32)
+
     def validate(self) -> None:
         for value in (self.vless_uuid, self.vmess_uuid, self.tuic_uuid):
             if str(uuid.UUID(value)) != value:

@@ -7,10 +7,12 @@ import argparse
 from getpass import getpass
 import ipaddress
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import time
+from typing import Any
 
 from . import __version__
 from .argo import argo_host, quick_url_from_log, read_state as read_argo_state, wait_for_quick_url, write_state as write_argo_state
@@ -59,12 +61,14 @@ from .models import (
     Socks5Settings,
     WarpCredential,
 )
-from .network import geolocation_summary, summary as network_summary
+from .network import geolocation_summary, preferred_host, summary as network_summary
 from .services import (
     identity,
     require_active,
+    service_enabled,
     service_exists,
     service_logs_command,
+    service_restart,
     service_start,
     service_state_text,
     service_stop,
@@ -82,8 +86,18 @@ from .subscription import (
     status as subscription_status,
 )
 from .system import read_token_file, validate_token_text
-from .util import available, load_json, require_linux_root, run, split_host_port
+from .util import available, load_json, random_free_port, require_linux_root, run, split_host_port
 from .warp import import_warp_credential, register_warp
+
+
+SERVICE_UNITS = {
+    "core": "sbox5.service",
+    "argo": "sbox5-argo.service",
+    "ddns": "sbox5-ddns.timer",
+    "subscription": "sbox5-subscription.service",
+    "firewall": "sbox5-firewall.service",
+}
+TRUSTED_ORIGIN = "https://github.com/Bosco1262/singbox-vps-core5"
 
 
 def _interactive(args: argparse.Namespace) -> bool:
@@ -97,6 +111,22 @@ def _prompt(value: str, label: str, args: argparse.Namespace, secret: bool = Fal
         prompt = label + tr(": ", "：")
         return (getpass(prompt) if secret else input(prompt)).strip()
     raise ConfigError(tr(f"Missing {label} in non-interactive mode", f"非交互模式缺少 {label}"))
+
+
+def _prompt_default(value: str, default: str, label: str, args: argparse.Namespace) -> str:
+    if value:
+        return value
+    if not _interactive(args):
+        if default:
+            return default
+        raise ConfigError(tr(f"Missing {label} in non-interactive mode", f"非交互模式缺少 {label}"))
+    suffix = f" [{default}]" if default else ""
+    answer = input(label + suffix + tr(": ", "：")).strip()
+    if answer:
+        return answer
+    if default:
+        return default
+    raise ConfigError(tr(f"Missing {label}", f"缺少 {label}"))
 
 
 def _confirm(args: argparse.Namespace, text: str) -> None:
@@ -128,7 +158,14 @@ def _add_install_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--acme-dns-token-file", type=Path)
     parser.add_argument("--vmess-tls", action=argparse.BooleanOptionalAction, default=None)
     for protocol in ("vless", "vmess", "hysteria2", "tuic", "anytls"):
-        parser.add_argument(f"--{protocol}-port", type=int)
+        parser.add_argument(
+            f"--{protocol}-port",
+            type=int,
+            help=tr(
+                "Random free port in 10000-65535 when omitted on a fresh install",
+                "全新安装时省略则随机选择 10000-65535 的空闲端口",
+            ),
+        )
     parser.add_argument("--firewall", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--bbr", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--hysteria2-port-hopping", metavar="START:END")
@@ -160,6 +197,34 @@ def _add_language_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _select_ports(
+    args: argparse.Namespace,
+    previous: Settings | None,
+    hopping: dict[str, str],
+    argo_enabled: bool,
+) -> Ports:
+    ports = Ports()
+    explicit = {protocol: getattr(args, f"{protocol}_port") for protocol in ports.as_dict()}
+    if previous is not None:
+        for protocol, value in explicit.items():
+            setattr(ports, protocol, value if value is not None else getattr(previous.ports, protocol))
+        return ports
+
+    reserved = {value for value in explicit.values() if value is not None}
+    for value in hopping.values():
+        start, separator, end = value.partition(":")
+        if separator and start.isdigit() and end.isdigit():
+            reserved.update(range(int(start), int(end) + 1))
+    if argo_enabled:
+        reserved.add(args.argo_local_port or 18081)
+    for protocol, value in explicit.items():
+        if value is None:
+            value = random_free_port(reserved)
+            reserved.add(value)
+        setattr(ports, protocol, value)
+    return ports
+
+
 def _request(args: argparse.Namespace, upgrade: bool) -> tuple[Settings, Secrets, str, str]:
     previous = load_settings() if upgrade else None
     secrets = load_secrets() if upgrade else Secrets()
@@ -174,7 +239,11 @@ def _request(args: argparse.Namespace, upgrade: bool) -> tuple[Settings, Secrets
     previous_ddns = previous.ddns if previous else DDNSSettings()
     record = args.ddns_record or previous_ddns.record
     host = args.host or (record if ddns_enabled else "") or (previous.host if previous else "")
-    host = _prompt(host, tr("Server public IP or domain", "服务器公网 IP 或域名"), args)
+    if not host:
+        host = _prompt_default(
+            "", preferred_host(),
+            tr("Server public IP or domain", "服务器公网 IP 或域名"), args,
+        )
     if ddns_enabled and not record:
         record = host
     zone = args.cloudflare_zone or previous_ddns.zone
@@ -218,13 +287,6 @@ def _request(args: argparse.Namespace, upgrade: bool) -> tuple[Settings, Secrets
         ca_provider=default_previous.ca_provider if default_previous else "letsencrypt",
         acme_profile=default_previous.acme_profile if default_previous else "",
     ))
-    ports = Ports()
-    for protocol in ports.as_dict():
-        argument = getattr(args, f"{protocol}_port")
-        if argument is not None:
-            setattr(ports, protocol, argument)
-        elif previous:
-            setattr(ports, protocol, getattr(previous.ports, protocol))
     hopping = dict(previous.port_hopping) if previous else {}
     if args.no_port_hopping and (args.hysteria2_port_hopping or args.tuic_port_hopping):
         raise ConfigError(tr(
@@ -238,6 +300,7 @@ def _request(args: argparse.Namespace, upgrade: bool) -> tuple[Settings, Secrets
             hopping["hysteria2"] = args.hysteria2_port_hopping
         if args.tuic_port_hopping:
             hopping["tuic"] = args.tuic_port_hopping
+    ports = _select_ports(args, previous, hopping, argo_enabled)
     protocols = {name: value for name, value in (previous.protocols.items() if previous else [])}
     if args.vmess_tls is not None:
         protocols.setdefault("vmess", previous.protocols["vmess"] if previous else None)
@@ -339,6 +402,9 @@ def _status(args: argparse.Namespace) -> int:
     state = load_json(STATE_PATH)
     settings = load_settings()
     secrets = load_secrets()
+    if args.text:
+        print(render_dashboard(dashboard_status(settings, secrets, geo=args.geo)))
+        return 0
     if args.geo:
         print(json.dumps({"geolocation": geolocation_summary()}, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
@@ -549,6 +615,108 @@ def _apply_reconfigure(
     return 0
 
 
+def _service(args: argparse.Namespace) -> int:
+    require_linux_root()
+    unit = SERVICE_UNITS[args.service]
+    if not service_exists(unit):
+        raise ConfigError(tr(f"The selected service is not installed: {unit}", f"所选服务未安装：{unit}"))
+    if args.service_command == "status":
+        print(f"{unit}: {service_state_text(unit)} enabled={service_enabled(unit)}")
+        return 0
+    if args.service_command == "start":
+        service_start(unit)
+    elif args.service_command == "stop":
+        service_stop(unit)
+    else:
+        service_restart(unit)
+    if args.service_command in ("start", "restart"):
+        require_active(unit)
+    print(tr("Service action completed: ", "服务操作完成：") + f"{unit} {args.service_command}")
+    return 0
+
+
+def _bbr(args: argparse.Namespace) -> int:
+    require_linux_root()
+    if args.bbr_command == "status":
+        values = {}
+        for key in ("net.core.default_qdisc", "net.ipv4.tcp_congestion_control"):
+            result = run(["sysctl", "-n", key], check=False)
+            values[key] = result.stdout.strip() if result.returncode == 0 else "unavailable"
+        print(json.dumps(values, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    settings, secrets = load_settings(), load_secrets()
+    settings.bbr = args.bbr_command == "enable"
+    return _apply_reconfigure(args, settings, secrets, "bbr")
+
+
+def _reality(args: argparse.Namespace) -> int:
+    require_linux_root()
+    settings, secrets = load_settings(), load_secrets()
+    settings.reality_target = args.target
+    settings.reality_sni = args.sni or split_host_port(args.target)[0]
+    return _apply_reconfigure(args, settings, secrets, "reality")
+
+
+def _secrets(args: argparse.Namespace) -> int:
+    require_linux_root()
+    settings, secrets = load_settings(), load_secrets()
+    secrets.rotate(args.protocol)
+    print(tr(
+        "Client links and exported profiles change after rotation; re-import them on every client.",
+        "轮换后客户端链接与导出配置会变化，请在每个客户端重新导入。",
+    ))
+    return _apply_reconfigure(args, settings, secrets, "secrets")
+
+
+def _trusted_origin(value: str) -> bool:
+    normalized = value.strip().rstrip("/")
+    if normalized.endswith(".git"):
+        normalized = normalized[:-4]
+    return normalized == TRUSTED_ORIGIN
+
+
+def _self_update(args: argparse.Namespace) -> int:
+    require_linux_root()
+    root = args.project_root.resolve()
+    if not (root / ".git").exists():
+        raise ConfigError(tr(
+            "The project is not a git checkout; update it manually.",
+            "项目不是 git 工作区；请手动更新。",
+        ))
+    if not available("git"):
+        raise ConfigError(tr("git is not installed", "未安装 git"))
+    if run(["git", "-C", str(root), "status", "--porcelain"], check=True).stdout.strip():
+        raise ConfigError(tr(
+            "The git working tree is not clean; commit or stow changes before updating.",
+            "git 工作区不干净；请先提交或暂存改动。",
+        ))
+    origin = run(["git", "-C", str(root), "remote", "get-url", "origin"], check=True).stdout.strip()
+    if not _trusted_origin(origin):
+        raise ConfigError(tr(
+            f"Refusing to update from an untrusted origin: {origin}",
+            f"拒绝从非受信 origin 更新：{origin}",
+        ))
+    branch = run(["git", "-C", str(root), "branch", "--show-current"], check=True).stdout.strip()
+    if not branch:
+        raise ConfigError(tr(
+            "The git checkout is detached; check out a branch before updating.",
+            "git 处于 detached 状态；请先切换到分支再更新。",
+        ))
+    _confirm(args, tr(
+        "Fetch the trusted origin and fast-forward the current branch?",
+        "从受信 origin 拉取并快进当前分支吗？",
+    ))
+    environment = dict(os.environ)
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    common = ["git", "-C", str(root), "-c", "core.hooksPath=/dev/null"]
+    run([*common, "fetch", "--no-tags", "origin"], timeout=300, env=environment)
+    run([*common, "merge", "--ff-only", f"origin/{branch}"], timeout=300, env=environment)
+    head = run(["git", "-C", str(root), "rev-parse", "--short", "HEAD"], check=True).stdout.strip()
+    print(tr("Project updated at commit: ", "项目已更新到提交：") + head)
+    print(tr("Run 'sbox5 upgrade' to apply locked components and configuration.", "请运行 'sbox5 upgrade' 应用锁定组件与配置。"))
+    return 0
+
+
 def _port(args: argparse.Namespace) -> int:
     require_linux_root()
     settings, secrets = load_settings(), load_secrets()
@@ -705,6 +873,27 @@ def _warp(args: argparse.Namespace) -> int:
     raise ConfigError(tr("Unknown WARP command", "未知 WARP 命令"))
 
 
+def _route_text(data: dict[str, Any]) -> str:
+    lines = [tr("Available targets: ", "可用目标：") + ", ".join(data["targets"])]
+    lines.append(tr("Domain routes:", "域名路由："))
+    if data["routes"]:
+        for route in data["routes"]:
+            lines.append(f"  {route['target']}: {', '.join(route['suffixes'])}")
+    else:
+        lines.append(tr("  (none)", "  （无）"))
+    lines.append(tr("Rule sets:", "规则集："))
+    if data["rule_sets"]:
+        for item in data["rule_sets"]:
+            lines.append(f"  {item['tag']} -> {item['target']} ({item['filename']})")
+    else:
+        lines.append(tr("  (none)", "  （无）"))
+    socks = data["socks5"]
+    lines.append(tr("Socks5: ", "Socks5：") + (
+        f"{socks['server']}:{socks['port']}" if socks.get("enabled") else tr("disabled", "未启用")
+    ))
+    return "\n".join(lines)
+
+
 def _route(args: argparse.Namespace) -> int:
     require_linux_root()
     settings, secrets = load_settings(), load_secrets()
@@ -716,7 +905,10 @@ def _route(args: argparse.Namespace) -> int:
             "warp": settings.warp.as_dict(),
             "targets": sorted(settings.route_targets()),
         }
-        print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) if args.json else json.dumps(data, ensure_ascii=False, sort_keys=True))
+        if args.text:
+            print(_route_text(data))
+        else:
+            print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) if args.json else json.dumps(data, ensure_ascii=False, sort_keys=True))
         return 0
     if args.route_command == "add":
         route = next((item for item in settings.routing.routes if item.target == args.target), None)
@@ -890,13 +1082,33 @@ def _certificate(args: argparse.Namespace) -> int:
     raise ConfigError(tr("Unknown certificate command", "未知证书命令"))
 
 
+def _core_text(status: dict[str, Any]) -> str:
+    catalog = status.get("catalog", {})
+    lines = [tr("Current: ", "当前：") + (status.get("current") or "-")]
+    lines.append(tr("Channels:", "通道："))
+    for name, version in catalog.get("channels", {}).items():
+        lines.append(f"  {name}: {version}")
+    lines.append(tr("Locked versions:", "锁定版本："))
+    for version, item in catalog.get("versions", {}).items():
+        lines.append(f"  {version} ({item.get('channel', '')}) {item.get('lock', '')}")
+    return "\n".join(lines)
+
+
 def _core(args: argparse.Namespace) -> int:
     require_linux_root()
     if args.core_command == "status":
-        print(json.dumps(core_status(args.project_root), ensure_ascii=False, indent=2, sort_keys=True))
+        status = core_status(args.project_root)
+        if args.text:
+            print(_core_text(status))
+        else:
+            print(json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     if args.core_command == "list":
-        print(json.dumps(core_catalog(args.project_root), ensure_ascii=False, indent=2, sort_keys=True))
+        status = core_status(args.project_root)
+        if args.text:
+            print(_core_text(status))
+        else:
+            print(json.dumps(status["catalog"], ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     if args.core_command == "switch":
         version = args.version
@@ -1060,6 +1272,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_install_arguments(upgrade)
     status = commands.add_parser("status", parents=[language], help=tr("Show non-sensitive runtime status", "显示非敏感运行状态"))
     status.add_argument("--geo", action="store_true", help=tr("Look up public IP geolocation over HTTPS", "通过 HTTPS 查询公网 IP 归属地"))
+    status.add_argument("--text", action="store_true", help=tr("Render the human-readable dashboard", "输出人类可读的状态面板"))
     show = commands.add_parser("show", parents=[language], help=tr("Show node credentials", "显示节点凭据"))
     show.add_argument("--protocol", choices=("vless", "vmess", "vmess-argo", "hysteria2", "tuic", "anytls"))
     show.add_argument("--json", action="store_true")
@@ -1078,6 +1291,36 @@ def build_parser() -> argparse.ArgumentParser:
     ip_set.add_argument("--family", choices=("auto", "ipv4", "ipv6"), required=True)
     ip_set.add_argument("--yes", action="store_true")
     commands.add_parser("menu", parents=[language], help=tr("Open the interactive menu", "打开交互菜单"))
+    service = commands.add_parser("service", parents=[language], help=tr("Start, stop, restart, or inspect a service", "启动、停止、重启或查看服务"))
+    service_commands = service.add_subparsers(dest="service_command", required=True)
+    service_labels = {
+        "start": tr("Start a service", "启动服务"),
+        "stop": tr("Stop a service", "停止服务"),
+        "restart": tr("Restart a service", "重启服务"),
+        "status": tr("Show service status", "查看服务状态"),
+    }
+    for action, label in service_labels.items():
+        service_action = service_commands.add_parser(action, parents=[language], help=label)
+        service_action.add_argument("--service", choices=tuple(SERVICE_UNITS), default="core")
+    bbr = commands.add_parser("bbr", parents=[language], help=tr("Show, enable, or disable BBR", "查看、开启或关闭 BBR"))
+    bbr_commands = bbr.add_subparsers(dest="bbr_command", required=True)
+    bbr_commands.add_parser("status", parents=[language], help=tr("Show the current congestion control", "查看当前拥塞控制算法"))
+    for action, label in (("enable", tr("Enable BBR", "开启 BBR")), ("disable", tr("Disable BBR", "关闭 BBR"))):
+        bbr_action = bbr_commands.add_parser(action, parents=[language], help=label)
+        bbr_action.add_argument("--yes", action="store_true")
+    reality = commands.add_parser("reality", parents=[language], help=tr("Manage the Reality handshake target", "管理 Reality 握手目标"))
+    reality_commands = reality.add_subparsers(dest="reality_command", required=True)
+    reality_set = reality_commands.add_parser("set", parents=[language], help=tr("Change the Reality target and SNI", "修改 Reality 目标与 SNI"))
+    reality_set.add_argument("--target", required=True)
+    reality_set.add_argument("--sni")
+    reality_set.add_argument("--yes", action="store_true")
+    secrets_parser = commands.add_parser("secrets", parents=[language], help=tr("Rotate protocol credentials", "轮换协议密钥"))
+    secrets_commands = secrets_parser.add_subparsers(dest="secrets_command", required=True)
+    secrets_rotate = secrets_commands.add_parser("rotate", parents=[language], help=tr("Rotate UUIDs, passwords, and the VMess path", "轮换 UUID、密码与 VMess 路径"))
+    secrets_rotate.add_argument("--protocol", choices=("all", *PROTOCOLS), default="all")
+    secrets_rotate.add_argument("--yes", action="store_true")
+    self_update = commands.add_parser("self-update", parents=[language], help=tr("Fast-forward the trusted git checkout", "快进受信 git 工作区"))
+    self_update.add_argument("--yes", action="store_true")
     port = commands.add_parser("port", parents=[language], help=tr("Change protocol ports or UDP hopping ranges", "修改协议端口或 UDP 跳跃范围"))
     port_commands = port.add_subparsers(dest="port_command", required=True)
     port_set = port_commands.add_parser("set", parents=[language], help=tr("Change one protocol port", "修改单个协议端口"))
@@ -1171,6 +1414,7 @@ def build_parser() -> argparse.ArgumentParser:
     route_commands = route.add_subparsers(dest="route_command", required=True)
     route_list = route_commands.add_parser("list", parents=[language], help=tr("Show routing state", "显示分流状态"))
     route_list.add_argument("--json", action="store_true")
+    route_list.add_argument("--text", action="store_true")
     route_add = route_commands.add_parser("add", parents=[language], help=tr("Route domain suffixes to a target", "将域名后缀分流到目标"))
     route_add.add_argument("--target", choices=ROUTE_TARGETS, required=True)
     route_add.add_argument("--suffix", action="append", required=True)
@@ -1219,8 +1463,10 @@ def build_parser() -> argparse.ArgumentParser:
     core_commands = core.add_subparsers(dest="core_command", required=True)
     core_status = core_commands.add_parser("status", parents=[language], help=tr("Show the active core version", "显示当前内核版本"))
     core_status.add_argument("--json", action="store_true")
+    core_status.add_argument("--text", action="store_true")
     core_list = core_commands.add_parser("list", parents=[language], help=tr("List locked versions and channels", "列出锁定版本与通道"))
     core_list.add_argument("--json", action="store_true")
+    core_list.add_argument("--text", action="store_true")
     core_switch = core_commands.add_parser("switch", parents=[language], help=tr("Switch to a locked core version", "切换到已锁定内核版本"))
     core_target = core_switch.add_mutually_exclusive_group(required=True)
     core_target.add_argument("--version")
@@ -1306,6 +1552,16 @@ def main(argv: list[str] | None = None) -> int:
             return _ip(args)
         if args.command == "menu":
             return _menu()
+        if args.command == "service":
+            return _service(args)
+        if args.command == "bbr":
+            return _bbr(args)
+        if args.command == "reality":
+            return _reality(args)
+        if args.command == "secrets":
+            return _secrets(args)
+        if args.command == "self-update":
+            return _self_update(args)
         if args.command == "port":
             return _port(args)
         if args.command == "protocol":

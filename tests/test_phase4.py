@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from sbox5 import network
-from sbox5.cli import build_parser
+from sbox5.cli import _select_ports, build_parser
 from sbox5.errors import ConfigError, ConflictError
 from sbox5.export import build_share_links
 from sbox5.firewall import apply_firewall
@@ -31,6 +31,7 @@ from sbox5.services import (
 )
 from sbox5.snapshot import _service_state
 from sbox5.system import _check_virtualization, _family, _version_numbers
+from sbox5.util import random_free_port
 
 
 def settings(**changes) -> Settings:
@@ -164,6 +165,40 @@ class PlatformTests(unittest.TestCase):
         self.assertEqual(parser.parse_args(["logs", "--service", "argo", "--follow"]).service, "argo")
         self.assertEqual(parser.parse_args(["doctor", "--json"]).json, True)
         self.assertEqual(parser.parse_args(["menu"]).command, "menu")
+
+
+class RandomPortTests(unittest.TestCase):
+    def test_random_free_port_skips_excluded_and_occupied_ports(self):
+        with mock.patch("sbox5.util.secrets.randbelow", side_effect=[1, 2, 3]), \
+             mock.patch("sbox5.util.port_is_free", side_effect=[True, False, True, True]):
+            self.assertEqual(random_free_port({10001}), 10003)
+
+    def test_fresh_install_randomizes_unspecified_ports(self):
+        args = build_parser().parse_args(["install"])
+        with mock.patch("sbox5.cli.random_free_port", side_effect=[20101, 20102, 20103, 20104, 20105]):
+            ports = _select_ports(args, None, {}, False)
+        self.assertEqual(ports.as_dict(), {
+            "vless": 20101, "vmess": 20102, "hysteria2": 20103, "tuic": 20104, "anytls": 20105,
+        })
+
+    def test_explicit_ports_and_reserved_ranges_are_avoided(self):
+        args = build_parser().parse_args(["install", "--vless-port", "12345"])
+        with mock.patch("sbox5.cli.random_free_port", side_effect=[20102, 20103, 20104, 20105]) as picker:
+            ports = _select_ports(args, None, {"hysteria2": "30000:30010"}, True)
+        self.assertEqual(ports.vless, 12345)
+        for call in picker.call_args_list:
+            reserved = call.args[0]
+            self.assertIn(12345, reserved)
+            self.assertIn(18081, reserved)
+            self.assertTrue(set(range(30000, 30011)) <= reserved)
+
+    def test_upgrade_keeps_existing_ports(self):
+        previous = settings(ports=Ports(vless=20001, vmess=20002, hysteria2=20003, tuic=20004, anytls=20005))
+        args = build_parser().parse_args(["upgrade"])
+        with mock.patch("sbox5.cli.random_free_port") as picker:
+            ports = _select_ports(args, previous, {}, False)
+        picker.assert_not_called()
+        self.assertEqual(ports.as_dict(), previous.ports.as_dict())
 
 
 class FirewalldTests(unittest.TestCase):

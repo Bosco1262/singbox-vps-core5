@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -169,3 +170,18 @@ def port_is_free(port: int, protocol: str) -> bool:
             return True
         except OSError:
             return False
+
+
+def random_free_port(excluded: set[int] | None = None) -> int:
+    blocked = excluded or set()
+    span = 65535 - 10000 + 1
+    for _ in range(512):
+        candidate = 10000 + secrets.randbelow(span)
+        if candidate in blocked:
+            continue
+        if port_is_free(candidate, "tcp") and port_is_free(candidate, "udp"):
+            return candidate
+    raise ConfigError(tr(
+        "Unable to find a free random port; specify the protocol ports explicitly",
+        "无法找到可用的随机端口；请显式指定协议端口",
+    ))
